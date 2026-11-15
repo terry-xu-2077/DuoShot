@@ -7,7 +7,9 @@ import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useLayo
 // 文字本身还是 @名称（存盘、复制、发给 AI 的都是它），只是在文本框上面盖一个不透明的标签把它遮住。
 // 标签得比 @名称 本身宽才盖得住（缩略图要占位置），所以插入时在后面带一个全角空格（U+2003）当「占位」，
 // 标签盖住 @名称 + 这个占位。发给 AI 之前会把占位换成普通空格。
-export const MENTION_GAP = '  '
+// 标签的盖板比 @名称 的位置往右缩进这么多：两个标签紧挨着的交界处露出一条缝，光标（落在交界上）才看得见
+const CARET_WINDOW = 3
+export const MENTION_GAP ='  '
 
 // 在 value 里找出所有「@资产名」（名字有长有短时优先匹配长的），以及紧跟着的占位空格
 export function findMentions(value, items) {
@@ -162,6 +164,8 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
   const [selRange, setSelRange] = useState(null)   // 当前正在选中的文字 {s, e}（标准选中样式，没有固定）
   const [selGeom, setSelGeom] = useState(null)     // 当前选中文字的外轮廓：图钉按钮放在它的右上角
   const [focused, setFocused] = useState(false)
+  const [caretPos, setCaretPos] = useState(-1)      // 光标（没选中文字时）的位置
+  const [selSpan, setSelSpan] = useState(null)      // 当前选中的范围：被选中的 @标签 要跟着变成选中色（标签盖住了系统自带的高亮）
   const selMeasureRef = useRef(null)
   const pinScrollRef = useRef(null)
   const [box, setBox] = useState({ sbw: 0, w: 0 })   // 滚动条宽度 / 文本框宽度：变了就要重新排版量一次
@@ -178,11 +182,37 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
   }, [pinSelection])
 
   // 拖动选择时选区一直在变：监听 document 的 selectionchange（只处理当前聚焦的这个文本框）
+  // @标签盖住了 @名称 和后面的占位空格：光标落在它们中间（点在标签旁边的空白处、或用方向键走进去）时，
+  // 光标被盖在标签底下看不见。这里把它挪到标签的前面或后面（往哪边挪看光标是往右还是往左走的）
+  const lastCaret = useRef(-1)
+  const snapCaret = useCallback(() => {
+    const ta = taRef.current
+    if (!ta || ta.selectionStart !== ta.selectionEnd) { lastCaret.current = -1; return }
+    const pos = ta.selectionStart
+    const prev = lastCaret.current
+    const t = (tokensRef.current || []).find((x) => pos > x.s && pos < x.e)
+    if (!t) { lastCaret.current = pos; return }
+    // 方向键一次只走一格：按走的方向跳过整个标签；其余（鼠标点的）就近
+    const stepped = prev >= 0 && Math.abs(pos - prev) === 1
+    const to = stepped ? (pos > prev ? t.e : t.s) : pos - t.s > (t.e - t.s) / 2 ? t.e : t.s
+    lastCaret.current = to
+    ta.setSelectionRange(to, to)
+  }, [])
+
+  const trackSel = useCallback(() => {
+    const ta = taRef.current
+    if (!ta) return
+    const s = ta.selectionStart
+    const e = ta.selectionEnd
+    setSelSpan((prev) => (s === e ? (prev ? null : prev) : prev && prev.s === s && prev.e === e ? prev : { s, e }))
+    setCaretPos(s === e ? s : -1)
+  }, [])
+
   useEffect(() => {
-    const onChange = () => { if (document.activeElement === taRef.current) readSel() }
+    const onChange = () => { if (document.activeElement === taRef.current) { snapCaret(); trackSel(); readSel() } }
     document.addEventListener('selectionchange', onChange)
     return () => document.removeEventListener('selectionchange', onChange)
-  }, [readSel])
+  }, [readSel, snapCaret, trackSel])
 
   const measureBox = useCallback(() => {
     const ta = taRef.current
@@ -271,7 +301,7 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
         else rows.push({ left: r.left, right: r.right, top: r.top, height: r.height })
       })
       rows.forEach((r, i) => out.push({
-        key: `${t.s}-${i}`, id: t.item.id, first: i === 0,
+        key: `${t.s}-${i}`, id: t.item.id, first: i === 0, s: t.s, e: t.e,
         left: Math.round((r.left - base.left) * 10) / 10,
         top: Math.round((r.top - base.top + r.height / 2 - 11) * 10) / 10,
         width: Math.round((r.right - r.left) * 10) / 10,
@@ -279,6 +309,16 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
     })
     setChips((prev) => (JSON.stringify(prev) === JSON.stringify(out) ? prev : out))
   }, [tokensKey, props.value, box])
+
+  // 光标正好停在某个标签的前沿 / 后沿时（两个标签紧挨着的交界），自己画一根光标：系统的那根会被标签盖板挡住
+  const caretMark = useMemo(() => {
+    if (caretPos < 0) return null
+    const next = chips.find((c) => c.first && c.s === caretPos)
+    if (next) return { x: next.left, top: next.top }
+    const prev = [...chips].reverse().find((c) => c.e === caretPos)
+    if (prev) return { x: prev.left + prev.width, top: prev.top }
+    return null
+  }, [caretPos, chips])
 
   // 光标不能停在 @名称 中间（那里被标签盖住了）：点进去 / 方向键走进去，就挪到标签后面
   const snapOutOfToken = () => {
@@ -375,7 +415,7 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
       <textarea
         {...rest}
         ref={taRef}
-        className={`editor ${className}`.trim()}
+        className={`editor ${className}${focused && caretMark ? ' own-caret' : ''}`.trim()}
         onFocus={(e) => { setFocused(true); onFocus?.(e) }}
         onBlur={(e) => { setFocused(false); setMenu(null); onBlur?.(e) }}
         onChange={(e) => { onChange?.(e); detectMention() }}
@@ -418,10 +458,11 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
           </div>
           <div className="sel-layer chip-layer" aria-hidden="true" style={layerStyle}>
             <div ref={chipScrollRef} className="sel-scroll">
+              {focused && caretMark && <i className="mcaret" style={{ left: caretMark.x - 1, top: caretMark.top - 2 }} />}
               {chips.map((c) => {
                 const it = mentionItems.find((x) => x.id === c.id)
                 return (
-                  <span key={c.key} className="mchip-cover" style={{ left: c.left, top: c.top, width: c.width }}>
+                  <span key={c.key} className={`mchip-cover${focused && selSpan && selSpan.s < c.e && selSpan.e > c.s ? ' sel' : ''}`} style={{ left: c.left + CARET_WINDOW, top: c.top, width: c.width - CARET_WINDOW }}>
                     {c.first && it && (
                       <span className="mchip">
                         {it.url ? <img src={it.url} alt="" draggable={false} /> : <i className="mi-ph" />}

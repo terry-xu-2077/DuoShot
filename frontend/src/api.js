@@ -36,12 +36,17 @@ const ROUTES = {
   'doc:open': ['doc_open', (a) => ({ id: a[0] })],
   'doc:delete': ['doc_delete', (a) => ({ id: a[0] })],
   'doc:export': ['doc_export', (a) => ({ id: a[0] })],
-  'asset:add': ['asset_add', (a) => ({ docId: a[0], name: a[1], dataUrl: a[2] })],
+  'asset:add': ['asset_add', (a) => ({ docId: a[0], name: a[1], dataUrl: a[2], thumbDataUrl: a[3] || null })],
+  'asset:addRef': ['asset_add_ref', (a) => ({ docId: a[0], path: a[1], thumbDataUrl: a[2] })],
+  'asset:readPath': ['asset_read_path', (a) => ({ path: a[0] })],
+  'asset:pick': ['pick_images', () => ({})],
+  'file:read': ['file_read', (a) => ({ path: a[0] })],
+  'asset:thumb': ['asset_thumb', (a) => ({ docId: a[0], assetId: a[1] })],
   'asset:data': ['asset_data', (a) => ({ docId: a[0], assetId: a[1] })],
   'asset:rename': ['asset_rename', (a) => ({ docId: a[0], assetId: a[1], name: a[2] })],
   'asset:remove': ['asset_remove', (a) => ({ docId: a[0], assetId: a[1] })],
   'ai:test': ['ai_test', (a) => ({ settings: a[0] })],
-  'ai:start': ['ai_start', (a) => ({ script: a[0], board: a[1], extra: a[2], images: a[3] || [] })],
+  'ai:start': ['ai_start', (a) => ({ message: a[0], images: a[1] || [] })],
   'ai:stop': ['ai_stop', () => ({})],
   'frame:setStyle': ['frame_set_style', (a) => ({ color: a[0], size: a[1] })],
 }
@@ -138,6 +143,7 @@ const boardMarkdown = (d) => {
     `### ${String(i + 1).padStart(2, '0')}${(b.title || '').trim() ? ` ${b.title.trim()}` : ''}`,
     ...(b.link && (b.link.preview || '').trim() ? [`> 对应剧本：${b.link.preview.trim()}`] : []),
     (b.text || '').trim() || '（空）',
+    ...((b.optimized || '').trim() ? ['**AI 优化稿：**', b.optimized.trim()] : []),
   ].join('\n\n')).join('\n\n')
 }
 
@@ -158,18 +164,31 @@ let aiAbort = null
 async function currentSettings() {
   const file = await fetchDevSettings()
   const base = { ...DEFAULT_SETTINGS }
+  let presets = []
+  let activePreset = ''
   if (file) {
     base.baseUrl = file.baseUrl || base.baseUrl
     base.model = file.model || ''
     base.temperature = file.temperature
     base.apiKey = file.hasKey ? DEV_KEY_MASK : ''
+    presets = (file.presets || []).map((p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, model: p.model, temperature: p.temperature, apiKey: p.hasKey ? DEV_KEY_MASK : '' }))
+    activePreset = file.activePreset || ''
   }
   const local = read(LS.set, null)
   if (local) {
-    for (const k of ['baseUrl', 'model', 'temperature']) if (local[k] !== undefined && local[k] !== '') base[k] = local[k]
-    if (local.apiKey && local.apiKey !== DEV_KEY_MASK) base.apiKey = local.apiKey
+    if (Array.isArray(local.presets)) {
+      // 预览里改过预设：整份用预览里的（没改过的 Key 仍是「沿用绿色版」，由开发服务器按预设 id 补上）
+      presets = local.presets
+      activePreset = local.activePreset || ''
+    } else {
+      for (const k of ['baseUrl', 'model', 'temperature']) if (local[k] !== undefined && local[k] !== '') base[k] = local[k]
+      if (local.apiKey && local.apiKey !== DEV_KEY_MASK) base.apiKey = local.apiKey
+    }
   }
-  return base
+  if (!presets.length && (base.model || base.apiKey)) presets = [{ id: 'default', name: '默认', baseUrl: base.baseUrl, model: base.model, temperature: base.temperature, apiKey: base.apiKey }]
+  const active = presets.find((p) => p.id === activePreset) || presets[0]
+  if (active) { base.baseUrl = active.baseUrl || base.baseUrl; base.model = active.model; base.temperature = active.temperature; base.apiKey = active.apiKey }
+  return { ...base, presets, activePreset: active ? active.id : '' }
 }
 
 function mockOptimized(board) {
@@ -188,7 +207,7 @@ const mock = {
     await ensureStore()
     switch (channel) {
       case 'settings:get': return currentSettings()
-      case 'settings:set': write(LS.set, a[0]); return a[0]
+      case 'settings:set': write(LS.set, a[0]); return currentSettings()
       case 'doc:get': {
         let docs = getDocs()
         if (!docs) {
@@ -260,6 +279,7 @@ const mock = {
         putDocs(docs)
         return { asset, assets: doc.assets }
       }
+      case 'asset:thumb':
       case 'asset:data': {
         const doc = (getDocs() || []).find((x) => x.id === a[0])
         const asset = doc?.assets?.find((x) => x.id === a[1])
@@ -311,11 +331,10 @@ const mock = {
           if (aiAbort) aiAbort.abort()
           const ctrl = new AbortController()
           aiAbort = ctrl
-          runDevAi(s, { script: a[0], board: a[1], extra: a[2], images: a[3] || [] }, (p) => { if (!ctrl.signal.aborted) emit(p) }, ctrl.signal)
+          runDevAi(s, { message: a[0], images: a[1] || [] }, (p) => { if (!ctrl.signal.aborted) emit(p) }, ctrl.signal)
           return { ok: true }
         }
-        const [, board] = a
-        const text = mockOptimized(board || DEMO_BOARD)
+        const text = mockOptimized(String(a[0] || '').split('【手写分镜稿】').pop() || DEMO_BOARD)
         let i = 0
         clearInterval(aiTimer)
         aiTimer = setInterval(() => {

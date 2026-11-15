@@ -3,6 +3,7 @@ import { api, isMock, aiConfigured, countChars, draftTitle, fmtClock, fmtShort }
 import WinControls from './components/WinControls.jsx'
 import AiPanel from './components/AiPanel.jsx'
 import Home from './components/Home.jsx'
+import BoardEditor from './components/BoardEditor.jsx'
 import ConfirmDialog from './components/ConfirmDialog.jsx'
 import MarkedTextarea, { MENTION_GAP } from './components/MarkedTextarea.jsx'
 import AssetLibrary from './components/AssetLibrary.jsx'
@@ -10,7 +11,7 @@ import MarkdownView from './components/MarkdownView.jsx'
 import BlockBar from './components/BlockBar.jsx'
 import LinkLine from './components/LinkLine.jsx'
 import { resolveAnchor, sameAnchor } from './anchor.js'
-import { isImageFile, prepareImage } from './assetImage.js'
+import { isImageFile, prepareImage, makeThumb, shrinkForAi } from './assetImage.js'
 import { readTextFile, fileTitle } from './readFile.js'
 import SettingsModal from './components/SettingsModal.jsx'
 import { IconGear, IconCopy, IconClose, IconStar4, IconClock, IconChevron, IconPencil, IconHome } from './components/Icons.jsx'
@@ -35,19 +36,25 @@ const normDoc = (doc) => {
 // 所有批次的正文拼在一起（统计字数、找 @ 引用用）
 const blocksText = (blocks) => (blocks || []).map((b) => b.text || '').join('\n\n')
 
-// 发给 AI 的分镜稿：每个批次带编号、名称，有关联剧本的话再附一行「对应剧本」，让 AI 知道哪段分镜对应剧本哪一段
-function boardForAi(blocks, assets) {
+// 发给 AI 的一整条消息（和以前在对话窗口里把参考图、手写分镜发给「分镜脚本大师」一样，只是由工具代发）：
+// 批次 / 对应的剧本片段（只有固定了选区才发；没固定就不发剧本）/ 上一批次的优化稿（衔接连续性）/ 参考图清单 / 手写的分镜稿 / 额外要求。
+// 参考图本身随请求附在文字后面，顺序与清单一致。
+function buildAiMessage({ script, blocks, target, assets, refs, extra }) {
   const fixGap = (txt) => assets.reduce((t, a) => t.split(`@${a.name}${MENTION_GAP}`).join(`@${a.name} `), txt || '')   // 标签占位的全角空格换回普通空格
-  return blocks
-    .filter((b) => (b.text || '').trim())
-    .map((b, i) => {
-      const head = `【批次 ${String(i + 1).padStart(2, '0')}${b.title.trim() ? `｜${b.title.trim()}` : ''}】`
-      const link = b.link && (b.link.preview || '').trim() ? `\n（对应剧本：「${b.link.preview.trim()}」）` : ''
-      return `${head}${link}\n${fixGap(b.text).trim()}`
-    })
-    .join('\n\n')
+  const idx = blocks.findIndex((b) => b.id === target.id)
+  const num = String(idx + 1).padStart(2, '0')
+  const parts = [`【批次】第 ${num} 个批次${target.title.trim() ? `，名称：${target.title.trim()}` : '（还没有起名）'}`]
+  const hit = target.link ? resolveAnchor(script, target.link) : null
+  const passage = hit ? script.slice(hit.s, hit.e).trim() : ''
+  if (passage) parts.push(`【对应的剧本片段】\n${passage}`)   // 批次没有固定剧本选区（或选区已失效）就不发剧本，只发手写的分镜稿
+  const prev = idx > 0 ? blocks[idx - 1] : null
+  if (prev && (prev.optimized || '').trim()) parts.push(`【上一批次的优化稿（本批次要从它的结尾状态继续）】\n${prev.optimized.trim()}`)
+  if (refs.length) parts.push(`【参考图】（图片会在文字之后按这个顺序依次附上）\n${refs.map((r, i) => `参考图${i + 1}：${r.name}`).join('\n')}`)
+  parts.push(`【手写分镜稿】\n${fixGap(target.text).trim()}`)
+  if ((extra || '').trim()) parts.push(`【额外要求】\n${extra.trim()}`)
+  return parts.join('\n\n')
 }
-const PHASE_LABEL = { running: '生成中', done: '已完成', stopped: '已停止', error: '出错' }
+const PHASE_LABEL ={ running: '生成中', done: '已完成', stopped: '已停止', error: '出错' }
 
 // 分镜稿里的「@名称」→ 引用到了资源库里的哪些图（按在分镜稿里第一次出现的顺序），以及找不到对应资产的 @名称。
 // 名称有长有短（@林舟 / @林舟_2），先按长名字匹配并把命中的部分抹掉，避免短名字误认。
@@ -100,7 +107,7 @@ function animateScroll(el, target) {
   raf = requestAnimationFrame(tick)
 }
 
-const MAX_AI_IMAGES = 8   // 一次 AI 优化最多附带几张资产图
+const MAX_AI_IMAGES = 12   // 一次 AI 优化最多附带几张资产图
 
 export default function App() {
   const [draft, setDraft] = useState(EMPTY)            // 当前打开的这份分镜稿
@@ -110,7 +117,9 @@ export default function App() {
   const [saveInfo, setSaveInfo] = useState({ state: 'idle', at: null })
   const [settings, setSettings] = useState(null)
   const [showSettings, setShowSettings] = useState(false)
-  const [ai, setAi] = useState({ phase: 'idle', text: '', error: '', extra: '' })
+  const [ai, setAi] = useState({ phase: 'idle', text: '', error: '', extra: '', target: '' })   // target：这次优化针对的批次 id
+  const [optView, setOptView] = useState('preview')     // AI 稿：preview Markdown 预览 / edit 编辑
+  const [boardMode, setBoardMode] = useState('src')       // 分镜稿页当前批次：src 手写分镜稿 / opt AI 优化稿
   const [confirmDel, setConfirmDel] = useState(null)   // 正在弹窗确认删除的分镜稿 {id, title}
   const [menuOpen, setMenuOpen] = useState(false)      // 分镜稿下拉是否展开
   const menuRef = useRef(null)
@@ -122,7 +131,7 @@ export default function App() {
   const pageRef = useRef('home')
   const slideT = useRef(null)
   const revealT = useRef(null)
-  const [scriptView, setScriptView] = useState('edit')    // 剧本页：edit 编辑 / preview Markdown 预览
+  const [scriptView, setScriptView] = useState('preview')    // 剧本页（默认 Markdown 预览）：edit 编辑 / preview Markdown 预览
   const [activeBlockId, setActiveBlockId] = useState('')   // 分镜稿页当前显示的批次
   const [confirmBlock, setConfirmBlock] = useState(null)      // 正在弹窗确认删除的批次
   const panesRef = useRef(null)
@@ -179,9 +188,10 @@ export default function App() {
     setDraft(doc)
     setActiveBlockId(doc.blocks[0]?.id || '')
     setSavedAt(doc.updatedAt || null)
-    setAi((p) => ({ ...p, phase: doc.optimized ? 'done' : 'idle', text: doc.optimized || '', error: '' }))
+    setAi((p) => ({ ...p, phase: 'idle', text: '', error: '', target: '' }))
+    setBoardMode('src')
     setRightTab('board')
-    setScriptView('edit')
+    setScriptView('preview')
   }, [])
 
   // ---------- 启动：读当前分镜稿、列表、设置 ----------
@@ -394,8 +404,7 @@ export default function App() {
     }
   }
   const askDeleteBlock = (b) => {
-    if ((b.text || '').trim() || (b.title || '').trim()) setConfirmBlock({ id: b.id, title: b.title.trim() || '（未命名）' })
-    else deleteBlockNow(b.id)
+    setConfirmBlock({ id: b.id, title: (b.title || '').trim() || '（未命名）' })   // 不管有没有内容，一律弹窗确认
   }
 
   // 在剧本里选中一段文字，点选区角上的图钉：把它固定下来，并关联到当前批次。
@@ -452,7 +461,15 @@ export default function App() {
     if (target === 'ai') { notify('AI优化页不接收文件：请拖到「分镜稿」页，或左边的剧本页', true); return }
     const file = files[0]
     let text
-    try { text = await readTextFile(file) } catch (e) { notify(e.message, true); return }
+    try {
+      if (file.path) {
+        // 桌面版拖进来的只有路径：让后端读出来，再交给同一套编码判断
+        const r = await api.invoke('file:read', file.path)
+        const bin = atob(r.base64)
+        const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
+        text = await readTextFile(new File([bytes], r.name || file.name))
+      } else text = await readTextFile(file)
+    } catch (e) { notify(e.message, true); return }
     if (target === 'home') {
       if (files.length > 1) notify('一次只会用第一个文件新建分镜稿，其余的已忽略')
       await importAsNewDoc(fileTitle(file.name), text)
@@ -504,6 +521,32 @@ export default function App() {
     }
   }, [])
 
+  // 桌面版：文件拖放由 Tauri 接管（只有这样才拿得到文件的真实路径，资产图才能「引用」而不是复制）。
+  // 位置是物理像素，换算成页面坐标后，找到鼠标下面带 data-drop 的区域。
+  useEffect(() => {
+    if (isMock) return undefined
+    let off = null
+    let dead = false
+    const baseName = (p) => p.split(/[\\/]/).pop() || p
+    const targetAt = (pos) => {
+      const r = window.devicePixelRatio || 1
+      return document.elementFromPoint(pos.x / r, pos.y / r)?.closest?.('[data-drop]')?.dataset.drop || null
+    }
+    import('@tauri-apps/api/webview').then(({ getCurrentWebview }) => getCurrentWebview().onDragDropEvent((ev) => {
+      const p = ev.payload
+      if (p.type === 'enter' || p.type === 'over') {
+        const t = targetAt(p.position)
+        setDropHot((prev) => (prev === t ? prev : t))
+      } else if (p.type === 'leave') {
+        setDropHot(null)
+      } else if (p.type === 'drop') {
+        setDropHot(null)
+        dropRef.current(targetAt(p.position), (p.paths || []).map((path) => ({ name: baseName(path), path })))
+      }
+    })).then((fn) => { if (dead) fn(); else off = fn }).catch(() => { })
+    return () => { dead = true; if (off) off() }
+  }, [])
+
   const confirmReplaceNow = () => {
     const { field, name, text } = confirmReplace
     setConfirmReplace(null)
@@ -520,7 +563,7 @@ export default function App() {
       const key = `${docId}/${a.id}`
       if (thumbsRef.current[key] !== undefined) return
       thumbsRef.current[key] = ''           // 先占位，避免重复请求
-      api.invoke('asset:data', docId, a.id)
+      api.invoke('asset:thumb', docId, a.id)
         .then((url) => { thumbsRef.current[key] = url; setThumbs((p) => ({ ...p, [key]: url })) })
         .catch(() => { delete thumbsRef.current[key] })
     })
@@ -544,11 +587,22 @@ export default function App() {
     const fails = []
     for (const f of imgs.slice(0, 30)) {
       try {
-        const img = await prepareImage(f)
-        const r = await api.invoke('asset:add', docId, img.name, img.dataUrl)
+        let r
+        let thumb
+        if (f.path) {
+          // 有原文件路径：只引用原图，不复制；这边生成一张缩略图存起来用于显示
+          const src = await api.invoke('asset:readPath', f.path)
+          thumb = await makeThumb(src.dataUrl)
+          r = await api.invoke('asset:addRef', docId, f.path, thumb)
+        } else {
+          // 没有路径（剪贴板粘贴、浏览器预览）：图片本身存一份
+          const img = await prepareImage(f)
+          thumb = await makeThumb(img.dataUrl)
+          r = await api.invoke('asset:add', docId, img.name, img.dataUrl, thumb)
+        }
         const key = `${docId}/${r.asset.id}`
-        thumbsRef.current[key] = img.dataUrl
-        setThumbs((p) => ({ ...p, [key]: img.dataUrl }))
+        thumbsRef.current[key] = thumb
+        setThumbs((p) => ({ ...p, [key]: thumb }))
         applyAssets(docId, r.assets)
         ok += 1
       } catch (e) { fails.push(`「${f.name}」${e.message}`) }
@@ -558,6 +612,34 @@ export default function App() {
     else notify(`已把 ${ok} 张图片加入资源库${imgs.length > 30 ? '（一次最多 30 张，其余的没有处理）' : ''}`)
   }
   addRef.current = addAssets
+
+  // 桌面版：原生选择对话框拿到路径（引用原图）；浏览器预览里 AssetLibrary 自己用 <input type=file>
+  const pickNative = async () => {
+    try {
+      const paths = await api.invoke('asset:pick')
+      if (paths && paths.length) await addAssets(paths.map((p) => ({ name: p.split(/[\\/]/).pop() || p, path: p })))
+    } catch (e) { notify(e.message || String(e), true) }
+  }
+
+  // 资源库里勾选了几张图：一次性把它们的「@名称」加到当前批次末尾（没有批次就新建一个）
+  const insertAssets = (list) => {
+    if (!list.length) return
+    const tokens = list.map((a) => `@${a.name}${MENTION_GAP}`).join('')
+    const cur = activeRef.current
+    setBoardMode('src')
+    setRightTab('board')
+    if (!cur) { addBlock({ text: tokens }); notify(`已新建一个批次，并加入 ${list.length} 张图的 @ 标签`); return }
+    const lead = cur.text && !cur.text.endsWith('\n') ? '\n' : ''
+    const add = `${lead}${tokens}`
+    // 等分镜稿页显示出来后，走编辑命令插入（Ctrl+Z 能撤销）；不行就直接改文字
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const ed = boardRef.current
+      let ok = false
+      try { ok = !!ed?.insertMentions(list, !!lead) } catch { ok = false }
+      if (!ok) editBlock(cur.id, { text: cur.text + add })
+    }))
+    notify(`已把 ${list.length} 张图的 @ 标签加入「${cur.title.trim() || '当前批次'}」`)
+  }
 
   const renameAsset = async (id, name) => {
     const docId = draftRef.current.id
@@ -587,13 +669,13 @@ export default function App() {
 
   // AI 优化会附带分镜稿里 @ 引用到的资产图
   const aiRefs = useMemo(() => {
-    const { used, missing } = resolveMentions(blocksText(draft.blocks), draft.assets || [])
+    const { used, missing } = resolveMentions(active?.text || '', draft.assets || [])
     return {
       used: used.map((a) => ({ id: a.id, name: a.name, url: thumbs[`${draft.id}/${a.id}`] })),
       missing,
       total: (draft.assets || []).length,
     }
-  }, [draft.blocks, draft.assets, draft.id, thumbs])
+  }, [active?.text, draft.assets, draft.id, thumbs])
 
   // ---------- 复制 ----------
   const copyText = async (text, what) => {
@@ -628,31 +710,31 @@ export default function App() {
     })
   }), [])
 
-  // 生成完成后，把优化结果单独存进分镜稿（optimized），刷新后仍在；不会动 board
+  // 生成完成后，把优化结果单独存进它针对的那个批次（optimized），刷新后仍在；不会动批次里手写的文字
   useEffect(() => {
-    if (ai.phase !== 'done') return
+    if (ai.phase !== 'done' || !ai.target) return
     const t = ai.text.replace(/\s+$/, '')
-    if ((draftRef.current.optimized || '') === t) return
-    const next = { ...draftRef.current, optimized: t }
+    const blk = (draftRef.current.blocks || []).find((b) => b.id === ai.target)
+    if (!blk || (blk.optimized || '') === t) return
+    const next = { ...draftRef.current, blocks: draftRef.current.blocks.map((b) => (b.id === ai.target ? { ...b, optimized: t } : b)) }
     draftRef.current = next
     setDraft(next)
     scheduleSave(next)
-  }, [ai.phase, ai.text, scheduleSave])
+  }, [ai.phase, ai.text, ai.target, scheduleSave])
 
   const startAi = async () => {
     if (!aiConfigured(settings)) { notify('还没配置 AI 接口，请先填写地址和模型名', true); setShowSettings(true); return }
     const d = draftRef.current
-    if (!d.script.trim()) { notify('左侧还没有剧本，AI 没法对照', true); return }
-    if (!blocksText(d.blocks).trim()) { notify('还没有分镜稿可以优化，请先在「分镜稿」里写', true); return }
-    // 分镜稿里 @ 引用到的资产图随请求一起发出去
-    const { used, missing } = resolveMentions(blocksText(d.blocks), d.assets || [])
+    const target = activeRef.current
+    if (!target || !(target.text || '').trim()) { notify('当前批次还是空的，请先在「分镜稿」里写，再来优化', true); return }
+    // 当前批次里 @ 引用到的资产图随请求一起发出去
+    const { used, missing } = resolveMentions(target.text, d.assets || [])
     const picked = used.slice(0, MAX_AI_IMAGES)
     const images = []
     for (const a of picked) {
-      let url = thumbsRef.current[`${d.id}/${a.id}`]
-      if (!url) {
-        try { url = await api.invoke('asset:data', d.id, a.id) } catch (e) { notify(`读取资产图「@${a.name}」失败：${e.message}`, true); return }
-      }
+      let url
+      try { url = await shrinkForAi(await api.invoke('asset:data', d.id, a.id)) }   // 读的是原图（引用的原文件），太大就缩小再发
+      catch (e) { notify(`读取资产图「@${a.name}」失败：${e.message}`, true); return }
       images.push({ name: a.name, dataUrl: url })
     }
     const notes = []
@@ -661,12 +743,25 @@ export default function App() {
     if (notes.length) notify(notes.join('；'))
     clearTimeout(saveT.current)
     await persist(d).catch(() => { })
-    setAi((p) => ({ ...p, phase: 'running', text: '', error: '' }))
-    try { await api.invoke('ai:start', d.script, boardForAi(d.blocks || [], d.assets || []), aiRef.current.extra.trim(), images) }
+    setAi((p) => ({ ...p, phase: 'running', text: '', error: '', target: target.id }))
+    const message = buildAiMessage({ script: d.script || '', blocks: d.blocks || [], target, assets: d.assets || [], refs: picked, extra: aiRef.current.extra })
+    try { await api.invoke('ai:start', message, images) }
     catch (e) { setAi((p) => ({ ...p, phase: 'error', error: e.message })) }
   }
 
   const stopAi = () => api.invoke('ai:stop').catch(() => { })
+
+  // AI 页里直接切换预设（不用进设置）：把选中的预设设为正在使用的，顶层字段换成它的副本
+  const switchPreset = async (id) => {
+    const cur = settings
+    const p = (cur?.presets || []).find((x) => x.id === id)
+    if (!p) return
+    try {
+      const saved = await api.invoke('settings:set', { baseUrl: p.baseUrl, model: p.model, apiKey: p.apiKey, temperature: p.temperature, presets: cur.presets, activePreset: id })
+      setSettings(saved)
+      notify(`已切换到「${p.name}」`)
+    } catch (e) { notify(e.message, true) }
+  }
 
   // ---------- 渲染 ----------
   const toggleMax = async () => {
@@ -680,7 +775,11 @@ export default function App() {
       : ready ? '内容会自动保存' : '读取中…'
 
   const view = rightTab
-  const showAiFab = !!ai.text && ai.phase !== 'running'   // AI 页有结果时才出现复制图标
+  const showOptView = view === 'board' && boardMode === 'opt' && !!active
+  // AI 优化页只跟「当前选中的批次」打交道：别的批次的上一次结果不在这里显示（正在生成的除外）
+  const aiShown = ai.target && active && ai.target !== active.id && ai.phase !== 'running' ? { ...ai, phase: 'idle', text: '', error: '' } : ai
+  const aiBatch = active ? { num: String(blocks.indexOf(active) + 1).padStart(2, '0'), title: active.title.trim(), hasOpt: !!(active.optimized || '').trim() } : null
+  const aiRunningFor = ai.phase === 'running' && active && ai.target !== active.id ? blocks.find((b) => b.id === ai.target) : null
 
   return (
     <div className={`app frameless dir-${dir}${isMock ? ' preview' : ''}`}>
@@ -845,17 +944,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className={`folder-body ${view === 'board' ? 'sq-left ' : ''}${view === 'lib' ? 'sq-right blue' : view === 'ai' ? `kraft${showAiFab ? ' has-fab' : ''}` : 'light'}`}>
-                {showAiFab && view === 'ai' && (
-                  <button
-                    className="copy-fab"
-                    onClick={() => copyText(ai.text, 'AI优化结果')}
-                    title="复制 AI 优化结果"
-                    aria-label="复制"
-                  >
-                    <IconCopy size={15} />
-                  </button>
-                )}
+              <div className={`folder-body ${view === 'board' ? 'sq-left ' : ''}${view === 'lib' ? 'sq-right blue' : view === 'ai' ? 'kraft' : 'light'}`}>
                 {(dropHot === 'board' || dropHot === 'ai' || dropHot === 'lib') && (
                   <div className="drop-hint">
                     {dropHot === 'lib' ? '松开鼠标，把图片加入资源库'
@@ -873,7 +962,39 @@ export default function App() {
                     onDelete={askDeleteBlock}
                     linkState={linkState}
                     onUnlink={unfixActive}
+                    mode={boardMode}
+                    onMode={setBoardMode}
                   />
+                )}
+                {showOptView && (
+                  <div className="opt-wrap">
+                    {/* 和剧本页一样的 MD 按钮：亮着 = Markdown 预览，灭了 = 编辑 */}
+                    <button
+                      className={`copy-fab md-fab${optView === 'preview' ? ' on' : ''}`}
+                      onClick={() => setOptView((v) => (v === 'preview' ? 'edit' : 'preview'))}
+                      title={optView === 'preview' ? '回到编辑' : '按 Markdown 预览 AI 稿'}
+                      aria-label="切换 Markdown 预览"
+                      aria-pressed={optView === 'preview'}
+                    >
+                      MD
+                    </button>
+                    {optView === 'edit'
+                      ? (
+                        <div className="editor-wrap">
+                          <textarea
+                            key={`${draft.id}/${active.id}/opt`}
+                            className="editor opt-editor"
+                            value={active.optimized || ''}
+                            onChange={(e) => editBlock(active.id, { optimized: e.target.value })}
+                            placeholder="AI 稿还是空的：可以直接在这里写，或到「AI优化」页让 AI 生成"
+                            spellCheck={false}
+                          />
+                        </div>
+                      )
+                      : (active.optimized || '').trim()
+                        ? <MarkdownView source={active.optimized} light />
+                        : <div className="opt-view"><div className="opt-empty">这个批次还没有 AI 稿。到右上角的「AI优化」页，点「开始优化」：AI 会按「W.分镜脚本大师」的方式，把你手写的分镜和这个批次引用的参考图一起理解，写出完整的分镜提示词。只处理当前选中的这个批次；结果存在这里，你手写的分镜稿不会被改动。也可以点右上角的 MD 切到编辑，自己写。</div></div>}
+                  </div>
                 )}
                 {view === 'board' && !active && (
                   <div className="block-empty">
@@ -883,14 +1004,14 @@ export default function App() {
                   </div>
                 )}
                 {active && (
-                  <MarkedTextarea
+                  <BoardEditor
                     key={`${draft.id}/${active.id}`}
                     ref={boardRef}
-                    hidden={view !== 'board'}
+                    hidden={view !== 'board' || boardMode === 'opt'}
                     mentionItems={(draft.assets || []).map((a) => ({ id: a.id, name: a.name, url: thumbs[`${draft.id}/${a.id}`] }))}
                     mentionEmpty="资源库还是空的：先到右上角的「资源库」页添加图片"
                     value={active.text}
-                    onChange={(e) => editBlock(active.id, { text: e.target.value })}
+                    onChange={(text) => editBlock(active.id, { text })}
                     placeholder={'在这里写这个批次的分镜…\n\n例如：\n镜头1｜全景｜雨夜街头，林舟撑伞走近旧书店\n镜头2｜中景｜林舟在门口站定，片刻后推门'}
                     spellCheck={false}
                     disabled={!ready}
@@ -903,6 +1024,9 @@ export default function App() {
                     docId={draft.id}
                     adding={adding}
                     onFiles={addAssets}
+                    onPickNative={isMock ? null : pickNative}
+                    onInsert={insertAssets}
+                    batchLabel={active ? (active.title.trim() || `批次 ${String(blocks.indexOf(active) + 1).padStart(2, '0')}`) : ''}
                     onRename={renameAsset}
                     onRemove={(a) => setConfirmAsset({ id: a.id, name: a.name })}
                   />
@@ -910,7 +1034,12 @@ export default function App() {
                 {view === 'ai' && (
                   <AiPanel
                     refs={aiRefs}
-                    ai={ai}
+                    ai={aiShown}
+                    batch={aiBatch}
+                    presets={settings?.presets || []}
+                    activePreset={settings?.activePreset || ''}
+                    onPreset={switchPreset}
+                    runningFor={aiRunningFor ? (aiRunningFor.title.trim() || '（未命名）') : ''}
                     setExtra={(v) => setAi((p) => ({ ...p, extra: v }))}
                     onStart={startAi}
                     onStop={stopAi}
@@ -930,7 +1059,7 @@ export default function App() {
 
       {confirmBlock && (
         <ConfirmDialog title="删除这个批次？" confirmText="删除" onConfirm={() => deleteBlockNow(confirmBlock.id)} onCancel={() => setConfirmBlock(null)}>
-          「{confirmBlock.title}」和它里面的文字会被删除（它和剧本的关联也一起没了），删除后无法恢复。
+          「{confirmBlock.title}」和它里面的内容会被删除（它和剧本的关联也一起没了），删除后无法恢复。
         </ConfirmDialog>
       )}
 

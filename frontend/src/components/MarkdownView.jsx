@@ -170,15 +170,18 @@ function rowsFromRange(range, base) {
   }
   rows.sort((a, b) => a.top - b.top)
   // 上下相接：每一行的下沿一直延伸到下一行的上沿，段落之间的空隙也被填上，整块才是连着的
+  // 整块向四周外扩一点（左右 10px、上下 6px），文字不要贴着区块边缘
+  const PX = 10
+  const PY = 6
   return rows.map((r, i) => ({
-    L: r.L - base.left - 4,
-    R: r.R - base.left + 4,
-    top: r.top - base.top,
-    bottom: (i + 1 < rows.length && rows[i + 1].top > r.bottom ? rows[i + 1].top : r.bottom) - base.top,
+    L: r.L - base.left - PX,
+    R: r.R - base.left + PX,
+    top: r.top - base.top - (i === 0 ? PY : 0),
+    bottom: (i + 1 < rows.length && rows[i + 1].top > r.bottom ? rows[i + 1].top : r.bottom) - base.top + (i === rows.length - 1 ? PY : 0),
   }))
 }
 
-export default function MarkdownView({ source, pinAnchor = null, onPinChange, onFix }) {
+export default function MarkdownView({ source, pinAnchor = null, onPinChange, onFix, light = false }) {
   const text = (source || '').replace(/\r\n?/g, '\n')
   const innerRef = useRef(null)
   const mapRef = useRef(null)          // 预览里所有文字拼成的一整段文字，以及每个文字节点的位置
@@ -254,12 +257,12 @@ export default function MarkdownView({ source, pinAnchor = null, onPinChange, on
   }, [compute])
 
   return (
-    <div className="md-view">
+    <div className={`md-view${light ? ' on-light' : ''}`}>
       <div ref={innerRef} className="md-inner">
         {geom && <svg className="md-sel" width="1" height="1" aria-hidden="true"><path key={fadeGen} className="sel-fade-in" d={geom.d} /></svg>}
         {ghost && <svg className="md-sel" width="1" height="1" aria-hidden="true"><path className="sel-fade-out" d={ghost} /></svg>}
         {text.trim() ? parseBlocks(text.split('\n')) : <p className="md-empty">（剧本还是空的，点右上角的 MD 切回编辑）</p>}
-        {sel && !geom && (   // 已经有固定的选区时不再冒出图钉；要换，先把已固定的那块叉掉
+        {sel && !geom && onFix && (   // 已经有固定的选区时不再冒出图钉；要换，先把已固定的那块叉掉
           <button
             type="button"
             className="pin-btn"

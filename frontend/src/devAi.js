@@ -2,17 +2,8 @@
 // Key 由开发服务器从绿色版的 settings.json 里补上，浏览器里拿不到；逻辑与 Rust 端 stream_chat 保持一致
 // （流式 SSE / 非流式兜底 / 过滤 <think> / 中文错误提示）。真实 exe 不会用到这个文件。
 
-// 与 src-tauri/src/lib.rs 里的 SYSTEM_PROMPT 保持一致
-const SYSTEM_PROMPT = [
-  '你是严谨的中文分镜稿校对助手。用户会给你【剧本】和【分镜稿】，请对照剧本校对并润色分镜稿：',
-  '1. 修正错别字、标点和明显不通顺的措辞；',
-  '2. 让分镜稿里的人名、地点、动作、台词与剧本保持一致；',
-  '3. 统一格式（镜头编号、分隔符、景别写法等）；沿用分镜稿本来的格式风格，除非用户提出了【额外要求】；',
-  '4. 不要增加、删除、合并或拆分镜头，也不要改变镜头顺序；',
-  '5. 只输出校对后的完整分镜稿正文，不要输出任何解释、前言、总结，也不要加 Markdown 代码块标记；',
-  '6. 分镜稿里的「@名称」表示引用了资源库里的一张资产图（角色 / 场景 / 道具的参考图），对应的图片会随后依次附上。请把每个 @名称 当作固定标记原样保留（不要改写、翻译或删除；名称后面原有的空格也保持不变），并可以参考图片内容，核对分镜里对该角色 / 场景 / 道具的描述是否与图片相符，修正明显不符的描述；',
-  '7. 分镜稿由若干「批次」组成，每个批次以「【批次 NN｜名称】」开头，有的批次下一行是「（对应剧本：「…」）」，表示它对应剧本里的哪一段。这些批次标题行和「对应剧本」行请原样保留，只校对批次里的分镜正文。',
-].join('\n')
+// 系统提示词和 Rust 端共用同一份文件（技能全文 + 本应用的调用约定）
+import SYSTEM_PROMPT from './skill/system-prompt.md?raw'
 
 export const DEV_KEY_MASK = '（沿用绿色版配置里的 Key）'
 
@@ -25,28 +16,14 @@ export async function fetchDevSettings() {
   } catch { return null }
 }
 
-function userMessage(script, board, extra) {
-  let s = `【剧本】
-${script.trim()}
-
-【分镜稿】
-${board.trim()}`
-  if ((extra || '').trim()) s += `
-
-【额外要求】
-${extra.trim()}`
-  return s
-}
-
-// 没有图片时是普通字符串；有图片时用 OpenAI 多模态格式（文字 + 一张张 image_url），和 Rust 端一致
-function userContent(script, board, extra, images) {
-  const text = userMessage(script, board, extra)
-  if (!images || !images.length) return text
-  const parts = [{ type: 'text', text }]
-  for (const img of images) {
-    parts.push({ type: 'text', text: `资产图「@${img.name}」：` })
+// 没有图片时是普通字符串；有图片时用 OpenAI 多模态格式（文字 + 每张图前面标上「参考图N」），和 Rust 端一致
+function userContent(message, images) {
+  if (!images || !images.length) return message
+  const parts = [{ type: 'text', text: message }]
+  images.forEach((img, i) => {
+    parts.push({ type: 'text', text: `参考图${i + 1}（${img.name}）：` })
     parts.push({ type: 'image_url', image_url: { url: img.dataUrl } })
-  }
+  })
   return parts
 }
 
@@ -109,6 +86,7 @@ function chatRequest(settings, payload, signal) {
     body: JSON.stringify({
       baseUrl: settings.baseUrl,
       apiKey: settings.apiKey === DEV_KEY_MASK ? '' : settings.apiKey,
+      presetId: settings.id || settings.activePreset || '',
       payload,
     }),
     signal,
@@ -116,12 +94,12 @@ function chatRequest(settings, payload, signal) {
 }
 
 // 流式优化：emit 收到 {type: chunk|done|error}；signal 被 abort 时悄悄退出
-export async function runDevAi(settings, { script, board, extra, images }, emit, signal) {
+export async function runDevAi(settings, { message, images }, emit, signal) {
   const payload = {
     model: settings.model,
     stream: true,
     temperature: Number(settings.temperature) || 0.3,
-    messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent(script, board, extra, images) }],
+    messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent(message, images) }],
   }
   let resp
   try { resp = await chatRequest(settings, payload, signal) } catch (e) {

@@ -21,6 +21,20 @@ function readPortableSettings() {
   }
 }
 
+// 绿色版 settings.json 里的 AI 预设（旧版只有顶层字段：当成一个叫「默认」的预设）
+function portablePresets(s) {
+  if (Array.isArray(s.presets)) {
+    return s.presets.map((p, i) => ({
+      id: String(p.id || `p${i}`), name: String(p.name || `预设 ${i + 1}`), baseUrl: String(p.baseUrl || ''), model: String(p.model || ''),
+      apiKey: String(p.apiKey || '').trim(), temperature: typeof p.temperature === 'number' ? p.temperature : 0.3,
+    }))
+  }
+  if (s.baseUrl || s.model) {
+    return [{ id: 'default', name: '默认', baseUrl: String(s.baseUrl || ''), model: String(s.model || ''), apiKey: String(s.apiKey || '').trim(), temperature: typeof s.temperature === 'number' ? s.temperature : 0.3 }]
+  }
+  return []
+}
+
 const readBody = (req) => new Promise((resolve, reject) => {
   const chunks = []
   req.on('data', (c) => chunks.push(c))
@@ -39,11 +53,15 @@ function devApiPlugin() {
       server.middlewares.use('/__dev/settings', (req, res) => {
         const s = readPortableSettings()
         res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        const presets = portablePresets(s)
         res.end(JSON.stringify({
           baseUrl: s.baseUrl || '',
           model: s.model || '',
           temperature: typeof s.temperature === 'number' ? s.temperature : 0.3,
           hasKey: !!(s.apiKey && String(s.apiKey).trim()),
+          // 预设：Key 本身不发给浏览器，只告诉有没有
+          presets: presets.map((p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, model: p.model, temperature: p.temperature, hasKey: !!p.apiKey })),
+          activePreset: s.activePreset || (presets[0] && presets[0].id) || '',
           source: PORTABLE_SETTINGS,
         }))
       })
@@ -120,10 +138,11 @@ function devApiPlugin() {
         const abort = new AbortController()
         res.on('close', () => abort.abort())
         try {
-          const { baseUrl, apiKey, payload } = JSON.parse(await readBody(req))
+          const { baseUrl, apiKey, presetId, payload } = JSON.parse(await readBody(req))
           const file = readPortableSettings()
-          const key = (apiKey && String(apiKey).trim()) || (file.apiKey ? String(file.apiKey).trim() : '')
-          const base = String(baseUrl || file.baseUrl || '').trim().replace(/\/+$/, '')
+          const preset = portablePresets(file).find((p) => p.id === presetId)   // 浏览器没有 Key 时，按预设 id 在服务端补上
+          const key = (apiKey && String(apiKey).trim()) || (preset ? preset.apiKey : (file.apiKey ? String(file.apiKey).trim() : ''))
+          const base = String(baseUrl || (preset ? preset.baseUrl : file.baseUrl) || '').trim().replace(/\/+$/, '')
           const url = base.endsWith('/chat/completions') ? base : `${base}/chat/completions`
           const headers = { 'Content-Type': 'application/json', Accept: payload.stream ? 'text/event-stream' : 'application/json' }
           if (key) headers.Authorization = `Bearer ${key}`

@@ -20,6 +20,8 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 # 资产图在前端 / 磁盘之间用 base64 传输
 base64 = "0.22"
+# 原生「选择图片」对话框
+rfd = "0.15"
 # Win32_System_Registry / Win32_UI_* 供 WebView2 缺失时的原生提示窗口使用（不依赖 WebView2 本身）
 windows = { version = "0.62", features = [
   "Win32_Foundation",

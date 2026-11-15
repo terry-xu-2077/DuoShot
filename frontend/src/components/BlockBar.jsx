@@ -3,7 +3,7 @@ import { IconChevron, IconClose } from './Icons.jsx'
 
 // 分镜稿页顶上的「批次栏」：编号 · 批次名（可直接改，点箭头切换批次）· ＋新建批次。
 // 一个批次 = 分镜稿里一段独立的文字，可以（不强制）关联剧本里的一段话；关联了的话会从剧本选区连一根线到这里。
-export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, onDelete, linkState, onUnlink }) {
+export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, onDelete, linkState, onUnlink, mode = 'src', onMode = () => { } }) {
   const [open, setOpen] = useState(false)
   const wrapRef = useRef(null)
   const index = Math.max(0, blocks.findIndex((b) => b.id === activeId))
@@ -43,6 +43,21 @@ export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, o
       )}
 
       <button className="bh-add" onClick={onAdd} title="新建批次" aria-label="新建批次">＋</button>
+
+      {/* 当前批次：看手写的分镜稿，还是看 AI 给它优化出来的版本 */}
+      {/* 左边是当前在看的内容，右边是开关（关：分镜稿，开：AI 优化稿）；同一时间只显示一种文字 */}
+      <button
+        className={`bh-mode${mode === 'opt' ? ' on' : ''}`}
+        role="switch"
+        aria-checked={mode === 'opt'}
+        onClick={() => onMode(mode === 'opt' ? 'src' : 'opt')}
+        disabled={!active}
+        title={mode === 'opt' ? '正在看 AI 优化稿，点击回到分镜稿' : active && active.optimized ? '点击查看这个批次的 AI 优化稿' : '点击查看 AI 优化稿（这个批次还没有）'}
+      >
+        <span className="bh-mode-text">{mode === 'opt' ? 'AI稿' : '原文'}</span>
+        <span className="bh-switch"><i /></span>
+        {mode !== 'opt' && active && active.optimized ? <i className="bh-mode-dot" /> : null}
+      </button>
 
       {open && (
         <ul className="bh-menu" role="listbox">

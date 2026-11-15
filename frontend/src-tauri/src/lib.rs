@@ -139,15 +139,70 @@ fn cfg_to_json(c: &AiCfg) -> Value {
     })
 }
 
+// ---------- AI 接口预设：可以建多个，切换不同的 AI 供应商 ----------
+// settings.json 里：presets = [{id, name, baseUrl, model, apiKey, temperature}]，activePreset = 正在用的那个的 id。
+// 顶层的 baseUrl / model / apiKey / temperature 始终是「正在用的预设」的副本，所以其它读取这些字段的地方不用改；
+// 旧版本只有顶层字段：读到时自动当成一个叫「默认」的预设。
+const MAX_PRESETS: usize = 20;
+
+fn clean_preset(v: &Value, idx: usize) -> Value {
+    let mut id: String = text_field(v, "id").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+    if id.is_empty() {
+        id = format!("p{}x{}", now_ms(), idx);
+    }
+    let mut name: String = text_field(v, "name").chars().take(30).collect();
+    if name.is_empty() {
+        name = format!("预设 {}", idx + 1);
+    }
+    json!({
+        "id": id,
+        "name": name,
+        "baseUrl": text_field(v, "baseUrl"),
+        "model": text_field(v, "model"),
+        "apiKey": text_field(v, "apiKey"),
+        "temperature": parse_temperature(v.get("temperature")),
+    })
+}
+
+fn presets_of(v: &Value) -> Vec<Value> {
+    if let Some(arr) = v.get("presets").and_then(|x| x.as_array()) {
+        return arr.iter().take(MAX_PRESETS).enumerate().map(|(i, p)| clean_preset(p, i)).collect();
+    }
+    if !text_field(v, "baseUrl").is_empty() || !text_field(v, "model").is_empty() {
+        let mut p = clean_preset(v, 0);
+        p["id"] = json!("default");
+        p["name"] = json!("默认");
+        return vec![p];
+    }
+    Vec::new()
+}
+
+fn active_of<'a>(v: &Value, presets: &'a [Value]) -> Option<&'a Value> {
+    let want = text_field(v, "activePreset");
+    presets.iter().find(|p| p["id"] == json!(want)).or_else(|| presets.first())
+}
+
+/// 给前端 / 写回 settings.json 的完整设置：顶层是正在用的预设的副本 + 全部预设 + 正在用的 id
+fn settings_json(v: &Value) -> Value {
+    let presets = presets_of(v);
+    let active = active_of(v, &presets).cloned();
+    let mut out = match &active {
+        Some(a) => cfg_to_json(&ai_cfg_from(a)),
+        None => cfg_to_json(&ai_cfg_from(v)),
+    };
+    out["presets"] = json!(presets);
+    out["activePreset"] = json!(active.as_ref().and_then(|a| a["id"].as_str()).unwrap_or(""));
+    out
+}
+
 #[tauri::command]
 fn get_settings() -> Value {
-    cfg_to_json(&ai_cfg_from(&read_settings()))
+    settings_json(&read_settings())
 }
 
 #[tauri::command]
 fn set_settings(settings: Value) -> Result<Value, String> {
-    let cfg = ai_cfg_from(&settings);
-    let out = cfg_to_json(&cfg);
+    let out = settings_json(&settings);
     write_settings(&out)?;
     Ok(out)
 }
@@ -180,6 +235,8 @@ struct Block {
     title: String,
     text: String,
     link: Option<ScriptLink>,
+    /// 这个批次的 AI 优化稿：单独存放，永远不会覆盖手写的批次文字
+    optimized: String,
 }
 
 /// 关联的剧本片段。不存字符位置（剧本改动后位置会变），而是存「去掉空白和 Markdown 标记后的文字」
@@ -199,6 +256,10 @@ struct Asset {
     /// 在分镜稿里用 @名称 引用它；名称里不会有空白和 @
     name: String,
     mime: String,
+    /// 原图的路径：资产只「引用」原图，不复制；资源库里看到的是我们自己生成的缩略图（<id>.thumb.jpg）。
+    /// 为空表示没有原图可引用（比如从剪贴板粘贴的图），这时图片本身存了一份在 assets 文件夹里。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    path: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -306,7 +367,7 @@ fn with_store<R>(write: bool, f: impl FnOnce(&mut StoreFile) -> R) -> Result<R, 
     // 旧数据：整块的 board 文字 → 迁移成一个批次（之后 board 不再写出）
     for d in store.docs.iter_mut() {
         if d.blocks.is_empty() && !d.board.trim().is_empty() {
-            d.blocks.push(Block { id: new_id(), title: String::new(), text: std::mem::take(&mut d.board), link: None });
+            d.blocks.push(Block { id: new_id(), title: String::new(), text: std::mem::take(&mut d.board), link: None, optimized: String::new() });
             dirty = true;
         } else if !d.board.is_empty() {
             d.board.clear();
@@ -497,14 +558,24 @@ fn doc_assets(doc_id: &str, s: &StoreFile) -> Result<Vec<Asset>, String> {
 }
 
 #[tauri::command]
-fn asset_add(doc_id: String, name: String, data_url: String) -> Result<Value, String> {
+fn asset_add(doc_id: String, name: String, data_url: String, thumb_data_url: Option<String>) -> Result<Value, String> {
     let (mime, bytes) = parse_data_url(&data_url)?;
     with_store(false, |s| doc_assets(&doc_id, s))??;
     let id = new_id();
-    let asset = Asset { id: id.clone(), name: clean_asset_name(&name), mime };
+    let asset = Asset { id: id.clone(), name: clean_asset_name(&name), mime, path: String::new() };
     let path = asset_file(&doc_id, &asset).ok_or("不支持的图片格式")?;
     fs::create_dir_all(asset_dir(&doc_id)).map_err(|e| format!("无法创建资源库文件夹：{e}"))?;
     fs::write(&path, &bytes).map_err(|e| format!("保存图片失败：{e}"))?;
+    if let Some(t) = thumb_data_url {
+        use base64::Engine as _;
+        if let Some((_, body)) = t.split_once(',') {
+            if let Ok(tb) = base64::engine::general_purpose::STANDARD.decode(body.trim()) {
+                if !tb.is_empty() && tb.len() <= 2 * 1024 * 1024 {
+                    let _ = fs::write(thumb_file(&doc_id, &id), tb);   // 缩略图失败不影响入库：读不到时退回图片本身
+                }
+            }
+        }
+    }
     with_store(true, |s| {
         let doc = s.docs.iter_mut().find(|d| d.id == doc_id).ok_or_else(|| "这份分镜稿已不存在".to_string())?;
         let mut asset = asset;
@@ -514,16 +585,137 @@ fn asset_add(doc_id: String, name: String, data_url: String) -> Result<Value, St
     })?
 }
 
-#[tauri::command]
-fn asset_data(doc_id: String, asset_id: String) -> Result<String, String> {
+const MAX_REF_BYTES: u64 = 40 * 1024 * 1024;
+
+fn thumb_file(doc_id: &str, asset_id: &str) -> PathBuf {
+    asset_dir(doc_id).join(format!("{}.thumb.jpg", safe_component(asset_id)))
+}
+
+fn ext_mime(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension()?.to_string_lossy().to_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+fn data_url(mime: &str, bytes: Vec<u8>) -> String {
     use base64::Engine as _;
-    let asset = with_store(false, |s| doc_assets(&doc_id, s))??
+    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn find_asset(doc_id: &str, asset_id: &str) -> Result<Asset, String> {
+    with_store(false, |s| doc_assets(doc_id, s))??
         .into_iter()
         .find(|a| a.id == asset_id)
-        .ok_or_else(|| "这张图已不在资源库里".to_string())?;
+        .ok_or_else(|| "这张图已不在资源库里".to_string())
+}
+
+/// 读出原图（给 AI 用）：引用的资产读原路径，粘贴来的读自己存的那份
+#[tauri::command]
+fn asset_data(doc_id: String, asset_id: String) -> Result<String, String> {
+    let asset = find_asset(&doc_id, &asset_id)?;
+    if !asset.path.is_empty() {
+        let p = PathBuf::from(&asset.path);
+        let meta = fs::metadata(&p).map_err(|_| format!("原图找不到了：{}（被移动、改名或删除了？）", asset.path))?;
+        if meta.len() > MAX_REF_BYTES {
+            return Err(format!("原图太大了（{:.1} MB）", meta.len() as f64 / 1048576.0));
+        }
+        let bytes = fs::read(&p).map_err(|e| format!("读取原图失败：{e}"))?;
+        return Ok(data_url(&asset.mime, bytes));
+    }
     let path = asset_file(&doc_id, &asset).ok_or("不支持的图片格式")?;
     let bytes = fs::read(&path).map_err(|e| format!("读取图片失败：{e}"))?;
-    Ok(format!("data:{};base64,{}", asset.mime, base64::engine::general_purpose::STANDARD.encode(bytes)))
+    Ok(data_url(&asset.mime, bytes))
+}
+
+/// 资源库里显示的缩略图：优先读生成好的小图，没有就退回图片本身（粘贴来的图）
+#[tauri::command]
+fn asset_thumb(doc_id: String, asset_id: String) -> Result<String, String> {
+    let t = thumb_file(&doc_id, &asset_id);
+    if let Ok(bytes) = fs::read(&t) {
+        return Ok(data_url("image/jpeg", bytes));
+    }
+    let asset = find_asset(&doc_id, &asset_id)?;
+    let path = asset_file(&doc_id, &asset).ok_or("不支持的图片格式")?;
+    let bytes = fs::read(&path).map_err(|e| format!("读取图片失败：{e}"))?;
+    Ok(data_url(&asset.mime, bytes))
+}
+
+/// 前端要给原图生成缩略图：按路径把图读出来（不入库）
+#[tauri::command]
+fn asset_read_path(path: String) -> Result<Value, String> {
+    let p = PathBuf::from(&path);
+    let mime = ext_mime(&p).ok_or("不支持这种图片格式，请用 jpg / png / webp / gif")?;
+    let meta = fs::metadata(&p).map_err(|_| "找不到这个文件".to_string())?;
+    if !meta.is_file() {
+        return Err("这不是一个文件".into());
+    }
+    if meta.len() > MAX_REF_BYTES {
+        return Err(format!("图片太大了（{:.1} MB），最多 40 MB", meta.len() as f64 / 1048576.0));
+    }
+    let bytes = fs::read(&p).map_err(|e| format!("读取图片失败：{e}"))?;
+    let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    Ok(json!({ "name": name, "mime": mime, "dataUrl": data_url(mime, bytes) }))
+}
+
+/// 引用原图加入资源库：只记路径，并存一张前端生成的缩略图
+#[tauri::command]
+fn asset_add_ref(doc_id: String, path: String, thumb_data_url: String) -> Result<Value, String> {
+    use base64::Engine as _;
+    let p = PathBuf::from(&path);
+    let mime = ext_mime(&p).ok_or("不支持这种图片格式，请用 jpg / png / webp / gif")?;
+    if !fs::metadata(&p).map(|m| m.is_file()).unwrap_or(false) {
+        return Err("找不到这个文件".into());
+    }
+    let (_, body) = thumb_data_url.split_once(',').ok_or("缩略图数据格式不对")?;
+    let thumb = base64::engine::general_purpose::STANDARD.decode(body.trim()).map_err(|e| format!("缩略图无法解码：{e}"))?;
+    if thumb.is_empty() || thumb.len() > 2 * 1024 * 1024 {
+        return Err("缩略图大小不对".into());
+    }
+    with_store(false, |s| doc_assets(&doc_id, s))??;
+    let id = new_id();
+    let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let asset = Asset { id: id.clone(), name: clean_asset_name(&name), mime: mime.to_string(), path: path.clone() };
+    fs::create_dir_all(asset_dir(&doc_id)).map_err(|e| format!("无法创建资源库文件夹：{e}"))?;
+    fs::write(thumb_file(&doc_id, &id), &thumb).map_err(|e| format!("保存缩略图失败：{e}"))?;
+    with_store(true, |s| {
+        let doc = s.docs.iter_mut().find(|d| d.id == doc_id).ok_or_else(|| "这份分镜稿已不存在".to_string())?;
+        let mut asset = asset;
+        asset.name = unique_asset_name(&asset.name, &doc.assets, None);
+        doc.assets.push(asset.clone());
+        Ok::<Value, String>(json!({ "asset": asset, "assets": doc.assets }))
+    })?
+}
+
+/// 原生「选择图片」对话框（可多选），返回所选文件的路径
+#[tauri::command]
+fn pick_images() -> Vec<String> {
+    rfd::FileDialog::new()
+        .set_title("选择要加入资源库的图片")
+        .add_filter("图片", &["jpg", "jpeg", "png", "webp", "gif"])
+        .pick_files()
+        .map(|v| v.into_iter().map(|p| p.to_string_lossy().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// 拖进窗口的文本文件：按路径读成 base64 交给前端解码（编码判断在前端）
+#[tauri::command]
+fn file_read(path: String) -> Result<Value, String> {
+    use base64::Engine as _;
+    let p = PathBuf::from(&path);
+    let meta = fs::metadata(&p).map_err(|_| "找不到这个文件".to_string())?;
+    if !meta.is_file() {
+        return Err("这不是一个文件".into());
+    }
+    if meta.len() > 4 * 1024 * 1024 {
+        return Err(format!("文件太大了（{:.1} MB）", meta.len() as f64 / 1048576.0));
+    }
+    let bytes = fs::read(&p).map_err(|e| format!("读取文件失败：{e}"))?;
+    let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    Ok(json!({ "name": name, "base64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
 }
 
 #[tauri::command]
@@ -548,8 +740,12 @@ fn asset_remove(doc_id: String, asset_id: String) -> Result<Value, String> {
         let doc = s.docs.iter_mut().find(|d| d.id == doc_id).ok_or_else(|| "这份分镜稿已不存在".to_string())?;
         if let Some(pos) = doc.assets.iter().position(|a| a.id == asset_id) {
             let a = doc.assets.remove(pos);
-            if let Some(p) = asset_file(&doc_id, &a) {
-                let _ = fs::remove_file(p);
+            // 只删我们自己存的缩略图 / 粘贴来的那份；引用的原图不动
+            let _ = fs::remove_file(thumb_file(&doc_id, &a.id));
+            if a.path.is_empty() {
+                if let Some(p) = asset_file(&doc_id, &a) {
+                    let _ = fs::remove_file(p);
+                }
             }
         }
         Ok(json!({ "assets": doc.assets }))
@@ -579,6 +775,10 @@ fn board_markdown(d: &Doc) -> String {
                 }
             }
             part.push(if b.text.trim().is_empty() { "（空）".to_string() } else { b.text.trim().to_string() });
+            if !b.optimized.trim().is_empty() {
+                part.push("**AI 优化稿：**".to_string());
+                part.push(b.optimized.trim().to_string());
+            }
             part.join("\n\n")
         })
         .collect::<Vec<_>>()
@@ -638,14 +838,20 @@ fn doc_export(id: String) -> Result<Value, String> {
 }
 
 // ---------- AI：OpenAI 兼容 /chat/completions ----------
-const SYSTEM_PROMPT: &str = "你是严谨的中文分镜稿校对助手。用户会给你【剧本】和【分镜稿】，请对照剧本校对并润色分镜稿：\n\
-1. 修正错别字、标点和明显不通顺的措辞；\n\
-2. 让分镜稿里的人名、地点、动作、台词与剧本保持一致；\n\
-3. 统一格式（镜头编号、分隔符、景别写法等）；沿用分镜稿本来的格式风格，除非用户提出了【额外要求】；\n\
-4. 不要增加、删除、合并或拆分镜头，也不要改变镜头顺序；\n\
-5. 只输出校对后的完整分镜稿正文，不要输出任何解释、前言、总结，也不要加 Markdown 代码块标记；\n\
-6. 分镜稿里的「@名称」表示引用了资源库里的一张资产图（角色 / 场景 / 道具的参考图），对应的图片会随后依次附上。请把每个 @名称 当作固定标记原样保留（不要改写、翻译或删除；名称后面原有的空格也保持不变），并可以参考图片内容，核对分镜里对该角色 / 场景 / 道具的描述是否与图片相符，修正明显不符的描述；\n\
-7. 分镜稿由若干「批次」组成，每个批次以「【批次 NN｜名称】」开头，有的批次下一行是「（对应剧本：「…」）」，表示它对应剧本里的哪一段。这些批次标题行和「对应剧本」行请原样保留，只校对批次里的分镜正文。";
+/// 系统提示词 = 「W.分镜脚本大师」技能全文 + 本应用的调用约定。和浏览器预览（devAi.js）共用 src/skill/system-prompt.md。
+/// 想换成自己的技能：在 exe 旁边放一个 skill.md，会优先用它（整段替换系统提示词）。
+const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../../src/skill/system-prompt.md");
+
+fn system_prompt() -> String {
+    let custom = exe_dir().join("skill.md");
+    if let Ok(text) = fs::read_to_string(&custom) {
+        let t = text.trim_start_matches('\u{feff}').trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    DEFAULT_SYSTEM_PROMPT.to_string()
+}
 
 fn chat_url(base: &str) -> String {
     let b = base.trim().trim_end_matches('/');
@@ -656,14 +862,6 @@ fn chat_url(base: &str) -> String {
     }
 }
 
-fn build_user_message(script: &str, board: &str, extra: &str) -> String {
-    let mut s = format!("【剧本】\n{}\n\n【分镜稿】\n{}", script.trim(), board.trim());
-    if !extra.trim().is_empty() {
-        s.push_str(&format!("\n\n【额外要求】\n{}", extra.trim()));
-    }
-    s
-}
-
 /// 随请求附带的资产图：name 是 @名称（不带 @），data_url 是 data:image/...;base64,...
 #[derive(Clone, Debug, Deserialize)]
 struct ImageRef {
@@ -672,15 +870,14 @@ struct ImageRef {
     data_url: String,
 }
 
-/// 没有图片时用普通字符串；有图片时用 OpenAI 的多模态格式（文字 + 一张张 image_url）
-fn build_user_content(script: &str, board: &str, extra: &str, images: &[ImageRef]) -> Value {
-    let text = build_user_message(script, board, extra);
+/// 没有图片时用普通字符串；有图片时用 OpenAI 的多模态格式（文字 + 一张张 image_url，每张前面标上「参考图N」）
+fn build_user_content(text: &str, images: &[ImageRef]) -> Value {
     if images.is_empty() {
-        return Value::String(text);
+        return Value::String(text.to_string());
     }
     let mut parts = vec![json!({ "type": "text", "text": text })];
-    for img in images {
-        parts.push(json!({ "type": "text", "text": format!("资产图「@{}」：", img.name) }));
+    for (i, img) in images.iter().enumerate() {
+        parts.push(json!({ "type": "text", "text": format!("参考图{}（{}）：", i + 1, img.name) }));
         parts.push(json!({ "type": "image_url", "image_url": { "url": img.data_url } }));
     }
     Value::Array(parts)
@@ -734,7 +931,7 @@ fn describe_error(e: ureq::Error) -> String {
 }
 
 fn prepare_request(cfg: &AiCfg, stream: bool) -> ureq::Request {
-    let agent = make_agent(if stream { 90 } else { 45 });
+    let agent = make_agent(if stream { 180 } else { 45 });   // 流式：两次数据之间最多等多久（推理型模型开头会想很久）
     let mut req = agent
         .post(&chat_url(&cfg.base_url))
         .set("Content-Type", "application/json")
@@ -928,14 +1125,14 @@ fn stream_chat(cfg: &AiCfg, body: &Value, cancelled: &dyn Fn() -> bool, emit: &m
     (sink.emit)(json!({ "type": "done" }));
 }
 
-fn run_ai(app: AppHandle, cfg: AiCfg, gen: u64, script: String, board: String, extra: String, images: Vec<ImageRef>) {
+fn run_ai(app: AppHandle, cfg: AiCfg, gen: u64, message: String, images: Vec<ImageRef>) {
     let body = json!({
         "model": cfg.model,
         "stream": true,
         "temperature": cfg.temperature,
         "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
-            { "role": "user", "content": build_user_content(&script, &board, &extra, &images) },
+            { "role": "system", "content": system_prompt() },
+            { "role": "user", "content": build_user_content(&message, &images) },
         ],
     });
     stream_chat(
@@ -949,9 +1146,7 @@ fn run_ai(app: AppHandle, cfg: AiCfg, gen: u64, script: String, board: String, e
 #[tauri::command]
 fn ai_start(
     app: AppHandle,
-    script: String,
-    board: String,
-    extra: String,
+    message: String,
     images: Option<Vec<ImageRef>>,
 ) -> Result<Value, String> {
     let images = images.unwrap_or_default();
@@ -959,11 +1154,11 @@ fn ai_start(
     if cfg.model.is_empty() {
         return Err("还没配置模型名，请先在设置里填写".into());
     }
-    if script.trim().is_empty() || board.trim().is_empty() {
-        return Err("剧本和分镜稿都不能为空".into());
+    if message.trim().is_empty() {
+        return Err("没有可以发给 AI 的内容".into());
     }
     let gen = AI_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    std::thread::spawn(move || run_ai(app, cfg, gen, script, board, extra, images));
+    std::thread::spawn(move || run_ai(app, cfg, gen, message, images));
     Ok(json!({ "ok": true }))
 }
 
@@ -1094,6 +1289,11 @@ pub fn run() {
             asset_data,
             asset_rename,
             asset_remove,
+            asset_thumb,
+            asset_read_path,
+            asset_add_ref,
+            pick_images,
+            file_read,
             ai_test,
             ai_start,
             ai_stop,
@@ -1170,7 +1370,7 @@ mod tests {
         assert_eq!(clean_asset_name("  男主 @林舟/正面.png "), "男主__林舟_正面.png");
         assert_eq!(clean_asset_name("@@"), "图片");
         assert_eq!(clean_asset_name(&"长".repeat(40)).chars().count(), 20);
-        let a = |id: &str, name: &str| Asset { id: id.into(), name: name.into(), mime: "image/png".into() };
+        let a = |id: &str, name: &str| Asset { id: id.into(), name: name.into(), mime: "image/png".into(), path: String::new() };
         let existing = vec![a("1", "林舟"), a("2", "林舟_2")];
         assert_eq!(unique_asset_name("林舟", &existing, None), "林舟_3");
         assert_eq!(unique_asset_name("林舟", &existing, Some("1")), "林舟"); // 改名时不和自己冲突
@@ -1189,14 +1389,47 @@ mod tests {
 
     #[test]
     fn user_content_is_plain_text_or_multimodal() {
-        assert!(build_user_content("剧本", "分镜", "", &[]).is_string());
+        assert!(build_user_content("消息", &[]).is_string());
         let imgs = vec![ImageRef { name: "林舟".into(), data_url: "data:image/png;base64,AAAA".into() }];
-        let v = build_user_content("剧本", "分镜 @林舟", "", &imgs);
+        let v = build_user_content("消息 @林舟", &imgs);
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["type"], "text");
-        assert_eq!(arr[1]["text"], "资产图「@林舟」：");
+        assert_eq!(arr[1]["text"], "参考图1（林舟）：");
         assert_eq!(arr[2]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn old_single_settings_become_one_default_preset() {
+        let old = json!({ "baseUrl": "http://x/v1", "model": "m", "apiKey": "k", "temperature": 0.5 });
+        let out = settings_json(&old);
+        assert_eq!(out["presets"].as_array().unwrap().len(), 1);
+        assert_eq!(out["activePreset"], "default");
+        assert_eq!(out["model"], "m");
+    }
+
+    #[test]
+    fn presets_mirror_the_active_one_to_top_level() {
+        let v = json!({
+            "presets": [
+                { "id": "a", "name": "本地", "baseUrl": "http://l/v1", "model": "q", "apiKey": "", "temperature": 0.2 },
+                { "id": "b", "name": "在线", "baseUrl": "https://o/v1", "model": "g", "apiKey": "sk", "temperature": 0.7 },
+            ],
+            "activePreset": "b",
+        });
+        let out = settings_json(&v);
+        assert_eq!(out["baseUrl"], "https://o/v1");
+        assert_eq!(out["apiKey"], "sk");
+        assert_eq!(out["activePreset"], "b");
+        // 指向不存在的预设时退回第一个
+        let v2 = json!({ "presets": v["presets"].clone(), "activePreset": "zzz" });
+        assert_eq!(settings_json(&v2)["activePreset"], "a");
+    }
+
+    #[test]
+    fn default_system_prompt_carries_the_skill() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("W.分镜脚本大师"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("本应用的调用约定"));
     }
 
     #[test]
@@ -1207,7 +1440,7 @@ mod tests {
         .unwrap();
         let mut d = old.docs[0].clone();
         assert!(d.blocks.is_empty() && !d.board.is_empty());
-        d.blocks.push(Block { id: "b1".into(), title: String::new(), text: std::mem::take(&mut d.board), link: None });
+        d.blocks.push(Block { id: "b1".into(), title: String::new(), text: std::mem::take(&mut d.board), link: None, optimized: String::new() });
         assert_eq!(d.blocks[0].text, "镜头1｜全景");
         let out = serde_json::to_value(&d).unwrap();
         assert!(out.get("board").is_none(), "迁移后不再写出 board");
@@ -1218,8 +1451,8 @@ mod tests {
     fn board_markdown_lists_blocks_and_links() {
         let d = Doc {
             blocks: vec![
-                Block { id: "1".into(), title: "冲出峡口".into(), text: "镜头01".into(), link: Some(ScriptLink { quote: "q".into(), nth: 0, preview: "866沿着旧路".into() }) },
-                Block { id: "2".into(), title: String::new(), text: "镜头02".into(), link: None },
+                Block { id: "1".into(), title: "冲出峡口".into(), text: "镜头01".into(), link: Some(ScriptLink { quote: "q".into(), nth: 0, preview: "866沿着旧路".into() }), optimized: String::new() },
+                Block { id: "2".into(), title: String::new(), text: "镜头02".into(), link: None, optimized: String::new() },
             ],
             ..Default::default()
         };
