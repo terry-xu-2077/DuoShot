@@ -1,4 +1,5 @@
 import { IconPin } from './Icons.jsx'
+import { useRegionFade } from '../useRegionFade.js'
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { blockPathFromRows } from './MarkedTextarea.jsx'
 import { domOffset, domPoint, domTextMap, makeAnchor, resolveAnchor, sameAnchor } from '../anchor.js'
@@ -186,6 +187,7 @@ export default function MarkdownView({ source, pinAnchor = null, onPinChange, on
   const onPinChangeRef = useRef(onPinChange)
   onPinChangeRef.current = onPinChange
   const [geom, setGeom] = useState(null)   // 已固定的选区外轮廓 {d, chipX, chipY}
+  const { gen: fadeGen, ghost } = useRegionFade(pinAnchor, geom)   // 换批次 / 取消固定时：新的淡入、旧的淡出
   const [sel, setSel] = useState(null)     // 当前选中的文字（标准选中样式）：{x, y, anchor}，图钉按钮放在 (x, y)
 
   // 钉住的选区由外面（App）持有「文字锚点」：这里按当前显示的文字把它找出来、量出轮廓
@@ -254,9 +256,10 @@ export default function MarkdownView({ source, pinAnchor = null, onPinChange, on
   return (
     <div className="md-view">
       <div ref={innerRef} className="md-inner">
-        {geom && <svg className="md-sel" width="1" height="1" aria-hidden="true"><path d={geom.d} /></svg>}
+        {geom && <svg className="md-sel" width="1" height="1" aria-hidden="true"><path key={fadeGen} className="sel-fade-in" d={geom.d} /></svg>}
+        {ghost && <svg className="md-sel" width="1" height="1" aria-hidden="true"><path className="sel-fade-out" d={ghost} /></svg>}
         {text.trim() ? parseBlocks(text.split('\n')) : <p className="md-empty">（剧本还是空的，点右上角的 MD 切回编辑）</p>}
-        {sel && !sameAnchor(sel.anchor, pinAnchor) && (
+        {sel && !geom && (   // 已经有固定的选区时不再冒出图钉；要换，先把已固定的那块叉掉
           <button
             type="button"
             className="pin-btn"

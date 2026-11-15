@@ -88,7 +88,9 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
 ::-webkit-scrollbar-thumb:hover { background: var(--line-strong); border: 2px solid transparent; background-clip: padding-box; }
-::selection { background: rgba(211, 203, 167, .5); color: inherit; }
+/* 文字选中色：偏亮的饱和蓝底白字。要在深灰（剧本）、米黄（分镜稿、批次标题）、牛皮纸上都看得清，
+   还要在「固定」后的深蓝块 #2c3278 里面也能分得出来（选中色太接近深蓝就看不见了） */
+::selection { background: #3f7be0; color: #fff; }
 
 /* ---------- 顶部：左 logo ｜ 中间标题（既是改名输入框，也是历史下拉）｜ 右 设置 ---------- */
 .topbar { position: relative; z-index: 30; height: 104px; flex-shrink: 0; display: flex; align-items: flex-start; gap: 10px; padding: 14px 10px 0 18px; }
@@ -657,7 +659,7 @@ button.brand-orb.on { border-color: var(--beige); color: var(--beige); }
 .editor-view.reveal .editor {
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(var(--rv) - 30%), transparent var(--rv));
   mask-image: linear-gradient(to bottom, #000 calc(var(--rv) - 30%), transparent var(--rv));
-  animation: rvWipe .9s linear .44s both;
+  animation: rvWipe .9s linear 0s both;
 }
 
 /* ---------- 拖入文件的提示 ---------- */
@@ -807,3 +809,20 @@ button.brand-orb.on { border-color: var(--beige); color: var(--beige); }
 .pin-layer { z-index: 5; }
 .pin-btn { position: absolute; width: 24px; height: 24px; margin: -12px 0 0 -4px; padding: 0; display: grid; place-items: center; border: none; border-radius: 50%; background: #2c3278; color: #fff; cursor: pointer; pointer-events: auto; box-shadow: 0 2px 6px rgba(0, 0, 0, .4); transition: transform .12s, filter .12s; }
 .pin-btn:hover { transform: scale(1.15); filter: brightness(1.2); }
+
+/* 层叠顺序：深蓝底（back）< 文本框（含系统选中高亮）< 浅色文字层（front）< 图钉 / 标签。
+   定位过的元素默认会盖在没定位的文本框上面，所以文本框要显式抬到深蓝底之上，固定区块里的选中高亮才看得见 */
+.editor-wrap .editor { position: relative; z-index: 1; }
+.sel-back { z-index: 0; }
+.sel-front { z-index: 2; }
+
+/* 进入项目页：先滑动、文字渐隐出现，之后剧本里固定的蓝色区块（和连线）再淡入 */
+.sel-back, .sel-front, .md-sel, .link-line, .md-inner .sel-chip { transition: opacity .7s ease; }
+.editor-view.reveal .sel-back, .editor-view.reveal .sel-front, .editor-view.reveal .md-sel, .editor-view.reveal .link-line, .editor-view.reveal .md-inner .sel-chip { opacity: 0; }
+
+/* 换批次 / 取消固定：新的蓝色区块（和连线）淡入，上一块淡出 */
+@keyframes selFadeInFrom { from { opacity: 0; } }
+@keyframes selFadeOutTo { to { opacity: 0; } }
+.sel-fade-in { animation: selFadeInFrom .4s ease; }
+.sel-fade-out { animation: selFadeOutTo .4s ease forwards; }
+.link-line { animation: selFadeInFrom .4s ease; }

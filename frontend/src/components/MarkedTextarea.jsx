@@ -1,5 +1,6 @@
 import { makeAnchor, resolveAnchor, sameAnchor } from '../anchor.js'
 import { IconPin } from './Icons.jsx'
+import { useRegionFade } from '../useRegionFade.js'
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 // 「@名称」在分镜稿里显示成【缩略图 + 名称】的小标签：
@@ -202,6 +203,7 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
   // 钉住的选区由外面（App）持有锚点：这里每次按当前文字重新找出它的位置，所以剧本在别处怎么改它都跟得上
   const pin = useMemo(() => (pinSelection && pinAnchor ? resolveAnchor(value, pinAnchor) : null), [pinSelection, pinAnchor, value])
   const valid = !!pin && pin.s < pin.e && pin.e <= value.length
+  const { gen: fadeGen, ghost } = useRegionFade(valid ? pinAnchor : null, geom)   // 换批次 / 取消固定时：新的淡入、旧的淡出
 
   // 量选区外轮廓：文字、选区、宽度任何一个变了都重新量
   useLayoutEffect(() => {
@@ -225,9 +227,9 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
     setSelGeom((old) => (old && g && old.chipX === g.chipX && old.chipY === g.chipY ? old : g))
   }, [pinSelection, selRange, value, box])
 
-  // 选中的这段已经就是固定的那段：不再显示图钉
   const selAnchor = useMemo(() => (pinSelection && selRange && selRange.e <= value.length ? makeAnchor(value, selRange.s, selRange.e) : null), [pinSelection, selRange, value])
-  const showPin = !!selAnchor && !!selGeom && focused && !sameAnchor(selAnchor, pinAnchor)
+  // 已经有固定的选区时不再冒出图钉；要换，先把已固定的那块叉掉
+  const showPin = !!selAnchor && !!selGeom && focused && !valid
   const fixNow = () => { if (selAnchor) onFix?.(selAnchor) }
 
   const syncScroll = () => {
@@ -362,10 +364,11 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
 
   return (
     <div ref={wrapRef} className={`editor-wrap${hidden ? ' is-hidden' : ''}${pinSelection ? ' pin' : ''}`}>
-      {valid && (
+      {(valid || ghost) && (
         <div className="sel-layer sel-back" aria-hidden="true" style={layerStyle}>
           <div ref={backScrollRef} className="sel-scroll">
-            {geom && <svg className="sel-svg" width="1" height="1"><path d={geom.d} /></svg>}
+            {geom && valid && <svg className="sel-svg" width="1" height="1"><path key={fadeGen} className="sel-fade-in" d={geom.d} /></svg>}
+            {ghost && <svg className="sel-svg" width="1" height="1"><path className="sel-fade-out" d={ghost} /></svg>}
           </div>
         </div>
       )}
@@ -487,7 +490,7 @@ const MarkedTextarea = forwardRef(function MarkedTextarea({ hidden, className = 
         )
       })()}
       {valid && (
-        <div className="sel-layer sel-front" aria-hidden={geom ? undefined : 'true'} style={layerStyle}>
+        <div key={fadeGen} className="sel-layer sel-front sel-fade-in" aria-hidden={geom ? undefined : 'true'} style={layerStyle}>
           <div ref={frontScrollRef} className="sel-scroll">
             <div ref={frontInnerRef} className="sel-inner" style={geom ? { clipPath: `path('${geom.d}')` } : { visibility: 'hidden' }}>
               {value}

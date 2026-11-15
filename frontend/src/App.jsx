@@ -66,6 +66,40 @@ function resolveMentions(board, assets) {
   return { used, missing }
 }
 
+// 自己用 requestAnimationFrame 做的平滑滚动（先慢、中间快、再慢）。
+// 不用 scrollTo({behavior:'smooth'})：它是否真的有动画取决于系统「显示动画」的设置，关掉时会瞬间跳过去。
+// 距离越远用时越长（380 ~ 900 毫秒）；你自己滚动滚轮 / 按下鼠标时会立刻停止。
+const scrollAnims = new WeakMap()
+function animateScroll(el, target) {
+  const max = Math.max(0, el.scrollHeight - el.clientHeight)
+  const to = Math.min(Math.max(0, target), max)
+  const from = el.scrollTop
+  const dist = to - from
+  const old = scrollAnims.get(el)
+  if (old) old.cancel()
+  if (Math.abs(dist) < 2) { el.scrollTop = to; return }
+  const duration = Math.min(900, Math.max(380, 260 + Math.abs(dist) * 0.45))
+  const start = performance.now()
+  let raf = 0
+  const stop = () => {
+    cancelAnimationFrame(raf)
+    el.removeEventListener('wheel', stop)
+    el.removeEventListener('mousedown', stop)
+    scrollAnims.delete(el)
+  }
+  const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - ((-2 * t + 2) ** 3) / 2)
+  const tick = (now) => {
+    const t = Math.min(1, (now - start) / duration)
+    el.scrollTop = from + dist * ease(t)
+    if (t < 1) raf = requestAnimationFrame(tick)
+    else stop()
+  }
+  el.addEventListener('wheel', stop, { passive: true })
+  el.addEventListener('mousedown', stop)
+  scrollAnims.set(el, { cancel: stop })
+  raf = requestAnimationFrame(tick)
+}
+
 const MAX_AI_IMAGES = 8   // 一次 AI 优化最多附带几张资产图
 
 export default function App() {
@@ -104,6 +138,7 @@ export default function App() {
   const boardRef = useRef(null)
   const dropRef = useRef(null)
   const addRef = useRef(null)
+  const scrollRef = useRef(null)
   const viewRef = useRef('board')
   const pageRef2 = useRef('home')
 
@@ -132,7 +167,8 @@ export default function App() {
     if (to === 'editor') {
       setReveal(true)
       clearTimeout(revealT.current)
-      revealT.current = setTimeout(() => setReveal(false), 1800)
+      // 滑动 → 文字渐隐出现（和滑动同时开始，约 0.9 秒）→ 再让剧本里固定的蓝色区块（和连线）淡入，并把剧本滚到那一段
+      revealT.current = setTimeout(() => { setReveal(false); scrollRef.current?.() }, 1000)
     }
   }, [])
 
@@ -314,8 +350,34 @@ export default function App() {
     setTimeout(() => boardRef.current?.focus(), 0)
   }
 
+  // 选中某个批次后，把剧本滚动到它固定的那一段，并保证整段都看得见：
+  // 已经完整可见就不动；放得下就居中；比剧本页还高就让它的开头贴近上沿。
+  // 等一小会儿再量：切换批次后蓝色块要先按新的关联重新画出来。
+  const scrollScriptToLink = () => {
+    // 不再人为延迟：等 React 把新区块画出来（两帧）就立刻开始滚，和区块的淡入淡出同时进行
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const body = document.querySelector('.panes .folder-body.solid')
+      const region = body?.querySelector('.sel-svg path.sel-fade-in, .md-sel path.sel-fade-in')
+      if (!body || !region) return
+      const scroller = body.querySelector('.md-view') || body.querySelector('textarea')
+      if (!scroller || scroller.offsetParent === null) return
+      const sr = scroller.getBoundingClientRect()
+      const rr = region.getBoundingClientRect()
+      const margin = 28
+      const fully = rr.top >= sr.top + margin && rr.bottom <= sr.bottom - margin
+      if (fully) return
+      const room = sr.height - margin * 2
+      const wanted = rr.height <= room ? rr.top - sr.top - (sr.height - rr.height) / 2 : rr.top - sr.top - margin
+      animateScroll(scroller, scroller.scrollTop + wanted)
+    }))
+  }
+
+  scrollRef.current = scrollScriptToLink
+
   const selectBlock = (id) => {
-    if (blocks.some((x) => x.id === id)) setActiveBlockId(id)   // 剧本里会自动显示这个批次固定了的那一段（没有关联就没有）
+    if (!blocks.some((x) => x.id === id)) return
+    setActiveBlockId(id)   // 剧本里会自动显示这个批次固定了的那一段（没有关联就没有）
+    scrollScriptToLink()
   }
 
   const deleteBlockNow = (id) => {
@@ -328,6 +390,7 @@ export default function App() {
     if (activeRef.current?.id === id) {
       const nb = rest[Math.min(i, rest.length - 1)] || null
       setActiveBlockId(nb?.id || '')
+      if (nb?.link) scrollScriptToLink()
     }
   }
   const askDeleteBlock = (b) => {
@@ -855,7 +918,7 @@ export default function App() {
                 )}
               </div>
             </section>
-            <LinkLine active={linkVisible && view === 'board'} hostRef={panesRef} />
+            <LinkLine key={active?.id || ''} active={linkVisible && view === 'board'} hostRef={panesRef} />
           </main>
           </div>
         )}
