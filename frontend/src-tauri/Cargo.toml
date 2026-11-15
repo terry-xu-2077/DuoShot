@@ -1,0 +1,42 @@
+[package]
+name = "storyboard-compare"
+version = "0.1.0"
+description = "剧本与分镜对照工具"
+authors = ["Terry"]
+edition = "2021"
+
+[lib]
+name = "storyboard_compare_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 流式调用 OpenAI 兼容接口：同步 HTTP 客户端，rustls（不依赖系统 OpenSSL），在后台线程里逐行读 SSE
+ureq = { version = "2", features = ["json"] }
+# 资产图在前端 / 磁盘之间用 base64 传输
+base64 = "0.22"
+# Win32_System_Registry / Win32_UI_* 供 WebView2 缺失时的原生提示窗口使用（不依赖 WebView2 本身）
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_Networking_WinHttp",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
