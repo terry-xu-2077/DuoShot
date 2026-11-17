@@ -49,7 +49,7 @@ function readPortableSettings() {
 function portablePresets(s) {
   if (Array.isArray(s.presets)) {
     return s.presets.map((p, i) => ({
-      id: String(p.id || `p${i}`), name: String(p.name || `预设 ${i + 1}`), baseUrl: String(p.baseUrl || ''), model: String(p.model || ''),
+      id: String(p.id || `p${i}`), name: String(p.name || `预设 ${i + 1}`), baseUrl: String(p.baseUrl || ''), model: String(p.model || ''), models: Array.isArray(p.models) ? p.models.map(String) : [],
       apiKey: String(p.apiKey || '').trim(), temperature: typeof p.temperature === 'number' ? p.temperature : 0.3,
     }))
   }
@@ -84,7 +84,7 @@ function devApiPlugin() {
           temperature: typeof s.temperature === 'number' ? s.temperature : 0.3,
           hasKey: !!(s.apiKey && String(s.apiKey).trim()),
           // 预设：Key 本身不发给浏览器，只告诉有没有
-          presets: presets.map((p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, model: p.model, temperature: p.temperature, hasKey: !!p.apiKey })),
+          presets: presets.map((p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, model: p.model, models: p.models, temperature: p.temperature, hasKey: !!p.apiKey })),
           activePreset: s.activePreset || (presets[0] && presets[0].id) || '',
           source: PORTABLE_SETTINGS,
         }))
@@ -179,6 +179,7 @@ function devApiPlugin() {
           res.end()
         } catch (e) {
           if (abort.signal.aborted) return
+          if (res.headersSent) { res.destroy(); return }   // 流到一半上游断了：直接断开，前端才知道输出不完整
           res.statusCode = 502
           res.setHeader('Content-Type', 'application/json; charset=utf-8')
           res.end(JSON.stringify({ proxyError: String(e && e.cause && e.cause.message ? e.cause.message : e.message || e) }))

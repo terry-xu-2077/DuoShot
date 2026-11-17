@@ -1,13 +1,14 @@
+import { createPortal } from 'react-dom'
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
-import { findMentions, MENTION_GAP } from './MarkedTextarea.jsx'
+import { findMentions, MENTION_GAP, mentionToken, stripIdMarks } from '../mentions.js'
 
 // 分镜稿（批次）的编辑器：contenteditable。
 // 资产标签（缩略图 + 名称）是编辑器里真正的行内元素（contenteditable=false），跟文字一起排版：
 // 光标、选中、换行、撤销都是浏览器自己处理，不需要在文字上盖东西。
 //
-// 存下来的数据格式不变：纯文本，资产写成「@名称」+ 两个全角空格（MENTION_GAP）。
-//   - 读：文本里的「@名称」（名称在资源库里能找到）→ 标签
-//   - 写：编辑器内容 → 纯文本，标签 → 「@名称」+ MENTION_GAP
+// 存下来的是纯文本，资产引用写成「@名称」+ 看不见的资产 id + 两个全角空格（见 mentions.js）；引用靠 id 认，资源库里改名不会让它失效。
+//   - 读：文本里的引用（按 id，旧数据按「@名称」）→ 标签，标签上显示资产现在的名字
+//   - 写：编辑器内容 → 纯文本，标签 → 引用（复制出去的是不带 id 的「@名称」）
 // 标签后面跟一个零宽空格（ZW），只是给光标一个落脚的地方（行尾的标签后面也能放光标），序列化时去掉。
 const ZW = '\u200b'
 
@@ -16,30 +17,31 @@ const isBlock =(n) => n.nodeType === 1 && /^(DIV|P|LI|H[1-6]|BLOCKQUOTE|PRE)$/.t
 const isChip = (n) => n && n.nodeType === 1 && n.dataset && n.dataset.mention !== undefined
 
 // 一个节点里的行内内容 → 文本（嵌套的块之间补换行）
-function inlineText(node) {
+const chipText = (c, plain) => (plain ? `@${c.dataset.mention}${MENTION_GAP}` : mentionToken({ name: c.dataset.mention, id: c.dataset.id }))
+function inlineText(node, plain) {
   let out = ''
   const kids = Array.from(node.childNodes)
   kids.forEach((c, i) => {
     if (c.nodeType === 3) out += c.nodeValue.split(ZW).join('')
-    else if (isChip(c)) out += `@${c.dataset.mention}${MENTION_GAP}`
+    else if (isChip(c)) out += chipText(c, plain)
     else if (c.nodeType === 1) {
       if (c.tagName === 'BR') { if (i < kids.length - 1) out += '\n' }   // 块末尾那个 <br> 只是占位，不是换行
-      else if (isBlock(c)) out += `${out && !out.endsWith('\n') ? '\n' : ''}${inlineText(c)}`
-      else out += inlineText(c)
+      else if (isBlock(c)) out += `${out && !out.endsWith('\n') ? '\n' : ''}${inlineText(c, plain)}`
+      else out += inlineText(c, plain)
     }
   })
   return out
 }
 
 // 整个编辑器 → 纯文本：每个块（Chrome 回车会生成 <div>）是一行
-export function serialize(root) {
+export function serialize(root, plain = false) {
   const lines = []
   let cur = null
   const flush = () => { if (cur !== null) { lines.push(cur); cur = null } }
   Array.from(root.childNodes).forEach((c) => {
-    if (isBlock(c)) { flush(); lines.push(inlineText(c)) }
+    if (isBlock(c)) { flush(); lines.push(inlineText(c, plain)) }
     else if (c.nodeType === 1 && c.tagName === 'BR') { if (cur === null) cur = ''; flush() }
-    else cur = (cur === null ? '' : cur) + (c.nodeType === 3 ? c.nodeValue.split(ZW).join('') : isChip(c) ? `@${c.dataset.mention}${MENTION_GAP}` : inlineText(c))
+    else cur = (cur === null ? '' : cur) + (c.nodeType === 3 ? c.nodeValue.split(ZW).join('') : isChip(c) ? chipText(c, plain) : inlineText(c, plain))
   })
   flush()
   return lines.join('\n')
@@ -78,17 +80,18 @@ function fillChip(chip, item) {
 const chipHtml = (item) => `${ZW}${makeChip(item).outerHTML}${ZW}`
 
 // 一行文本 → 一组节点（文字 + 标签）
-function lineNodes(line, items) {
+function lineNodes(rawLine, items) {
+  const line = rawLine
   const out = []
   const hits = findMentions(line, items)
   let pos = 0
   hits.forEach((h) => {
-    if (h.s > pos) out.push(document.createTextNode(line.slice(pos, h.s)))
+    if (h.s > pos) out.push(document.createTextNode(stripIdMarks(line.slice(pos, h.s))))
     if (!out.length) out.push(document.createTextNode(ZW))   // 行首的标签：前面也要有个落脚的地方，否则光标在这里是看不见的
     out.push(makeChip(h.item), document.createTextNode(ZW))
     pos = h.e
   })
-  if (pos < line.length) out.push(document.createTextNode(line.slice(pos)))
+  if (pos < line.length) out.push(document.createTextNode(stripIdMarks(line.slice(pos))))
   return out
 }
 
@@ -103,7 +106,23 @@ function build(root, value, items) {
   })
 }
 
-const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidden, disabled, placeholder, mentionItems, mentionEmpty, spellCheck = false, className = '' }, ref) {
+function ChipPeek({ peek, vis }) {
+  const W = 280
+  const r = peek.rect
+  const left = Math.min(window.innerWidth - W - 12, Math.max(12, r.left + r.width / 2 - W / 2))
+  const above = r.top > 260
+  // 和普通悬停提示一样淡入淡出：先以透明状态挂上，下一帧再变不透明；移开时只是变透明（内容保留到淡出结束）
+  const [on, setOn] = useState(false)
+  useEffect(() => { setOn(false); const id = requestAnimationFrame(() => setOn(true)); return () => cancelAnimationFrame(id) }, [peek])
+  return (
+    <div className={`chip-peek${on && vis ? ' show' : ''}`} style={{ left, width: W, ...(above ? { bottom: window.innerHeight - r.top + 8 } : { top: r.bottom + 8 }) }}>
+      <img src={peek.url} alt="" draggable={false} />
+      <span>{peek.name}</span>
+    </div>
+  )
+}
+
+const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidden, disabled, placeholder, mentionItems, mentionEmpty, spellCheck = false, className = '', peek: peekOn = true }, ref) {
   const rootRef = useRef(null)
   const wrapRef = useRef(null)
   const lastRef = useRef(null)          // 最近一次和外面同步过的文本
@@ -198,13 +217,33 @@ const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidd
     s.removeAllRanges()
     s.addRange(r)
   }
-  // 在文末插入一串资产标签（走编辑命令，Ctrl+Z 能撤销）。返回是否成功
+  // 记住光标最后停在哪：去资源库挑图时编辑器被隐藏、选区会丢，回来要插在原来的光标处
+  const caretRef = useRef(null)
+  useEffect(() => {
+    const onSel = () => {
+      const root = rootRef.current
+      const sel = window.getSelection()
+      if (!root || !root.offsetParent || !sel.rangeCount) return
+      const r = sel.getRangeAt(0)
+      if (root.contains(r.endContainer)) { const c = r.cloneRange(); c.collapse(false); caretRef.current = c }
+    }
+    document.addEventListener('selectionchange', onSel)
+    return () => document.removeEventListener('selectionchange', onSel)
+  }, [])
+  // 插入一串资产标签（走编辑命令，Ctrl+Z 能撤销）：有记住的光标就插在光标处，没有才加到文末（newLine：文末不是空行时先换一行）。返回是否成功
   const insertMentions = (list, newLine = false) => {
     const root = rootRef.current
     if (!root || !list.length) return false
     root.focus()
-    caretToEnd()
-    if (newLine) { try { document.execCommand('insertParagraph') } catch { /* 忽略 */ } }
+    const saved = caretRef.current
+    if (saved && root.contains(saved.endContainer)) {
+      const s = window.getSelection()
+      s.removeAllRanges()
+      s.addRange(saved)
+    } else {
+      caretToEnd()
+      if (newLine) { try { document.execCommand('insertParagraph') } catch { /* 忽略 */ } }
+    }
     const html = list.map(chipHtml).join('')
     try { return document.execCommand('insertHTML', false, html) } catch { return false }
   }
@@ -417,6 +456,23 @@ const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidd
     if (text === undefined) return
     e.preventDefault()
     const t = text.replace(/\r\n?/g, '\n')
+    // 复制 / 剪切出来的是「@名称」文字：粘贴时认出资源库里有的名字，还原成标签（否则剪切再粘贴会丢掉标签的样式）
+    if (findMentions(t, mentionItems).length) {
+      try {
+        t.split('\n').forEach((line, i) => {
+          if (i > 0) document.execCommand('insertParagraph')
+          let pos = 0
+          findMentions(line, mentionItems).forEach((h) => {
+            if (h.s > pos) document.execCommand('insertText', false, line.slice(pos, h.s))
+            document.execCommand('insertHTML', false, chipHtml(h.item))
+            pos = h.e
+          })
+          if (pos < line.length) document.execCommand('insertText', false, line.slice(pos))
+        })
+        emit()
+        return
+      } catch { /* 退回纯文本粘贴 */ }
+    }
     try { if (document.execCommand('insertText', false, t)) return } catch { /* 忽略 */ }
     emit()
   }
@@ -428,7 +484,7 @@ const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidd
     const box = document.createElement('div')
     box.appendChild(sel.getRangeAt(0).cloneContents())
     e.preventDefault()
-    e.clipboardData.setData('text/plain', serialize(box))
+    e.clipboardData.setData('text/plain', serialize(box, true))
     if (e.type === 'cut') { try { document.execCommand('delete') } catch { /* 忽略 */ } }
   }
 
@@ -443,6 +499,22 @@ const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidd
     document.addEventListener('selectionchange', onSel)
     return () => document.removeEventListener('selectionchange', onSel)
   }, [menu])
+
+  // 鼠标放到资产标签上：在旁边弹出这张图的大图预览（用缩略图，360px 长边）
+  const [peek, setPeek] = useState(null)   // { url, name, rect }：移开后保留，等淡出结束
+  const [peekVis, setPeekVis] = useState(false)
+  const peekEl = useRef(null)
+  const onChipOver = (e) => {
+    if (!peekOn) return
+    // 只有鼠标在缩略图上才预览，放在名字上不触发
+    const img = e.target instanceof Element && e.target.matches('.mchip img') ? e.target : null
+    if (img === peekEl.current) return
+    peekEl.current = img
+    const chip = img && img.closest('.mchip')
+    if (img) setPeek({ url: img.src, name: chip.dataset.mention, rect: img.getBoundingClientRect() })
+    setPeekVis(!!img)
+  }
+  const hidePeek = () => { peekEl.current = null; setPeekVis(false) }
 
   return (
     <div ref={wrapRef} className={`editor-wrap${hidden ? ' is-hidden' : ''}`}>
@@ -463,7 +535,12 @@ const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidd
         onCopy={onCopy}
         onCut={onCopy}
         onBlur={() => setMenu(null)}
+        onMouseOver={onChipOver}
+        onMouseLeave={hidePeek}
+        onMouseDown={hidePeek}
+        onScroll={hidePeek}
       />
+      {peek && createPortal(<ChipPeek peek={peek} vis={peekVis} />, document.body)}
       {empty && placeholder && <div className="editor-placeholder" aria-hidden="true">{placeholder}</div>}
       {menu && mentionOn && (() => {
         const wrap = wrapRef.current

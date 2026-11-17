@@ -154,11 +154,25 @@ fn clean_preset(v: &Value, idx: usize) -> Value {
     if name.is_empty() {
         name = format!("预设 {}", idx + 1);
     }
+    // 一个预设可以存多个模型名：去重、去空，正在用的那个（model）一定在里面
+    let model = text_field(v, "model");
+    let mut models: Vec<String> = Vec::new();
+    if let Some(arr) = v.get("models").and_then(|x| x.as_array()) {
+        for m in arr.iter().filter_map(|x| x.as_str()).map(|s| s.trim()) {
+            if !m.is_empty() && m.chars().count() <= 100 && !models.iter().any(|x| x == m) && models.len() < 50 {
+                models.push(m.to_string());
+            }
+        }
+    }
+    if !model.is_empty() && !models.contains(&model) {
+        models.insert(0, model.clone());
+    }
     json!({
         "id": id,
         "name": name,
         "baseUrl": text_field(v, "baseUrl"),
-        "model": text_field(v, "model"),
+        "model": model,
+        "models": models,
         "apiKey": text_field(v, "apiKey"),
         "temperature": parse_temperature(v.get("temperature")),
     })
@@ -192,6 +206,16 @@ fn settings_json(v: &Value) -> Value {
     };
     out["presets"] = json!(presets);
     out["activePreset"] = json!(active.as_ref().and_then(|a| a["id"].as_str()).unwrap_or(""));
+    // 「使用习惯」开关：只收布尔值，别的丢掉
+    let mut prefs = serde_json::Map::new();
+    if let Some(o) = v.get("prefs").and_then(|x| x.as_object()) {
+        for (k, val) in o.iter().take(30) {
+            if let Some(b) = val.as_bool() {
+                prefs.insert(k.chars().take(40).collect(), json!(b));
+            }
+        }
+    }
+    out["prefs"] = Value::Object(prefs);
     out
 }
 
@@ -237,6 +261,16 @@ struct Block {
     link: Option<ScriptLink>,
     /// 这个批次的 AI 优化稿：单独存放，永远不会覆盖手写的批次文字
     optimized: String,
+    /// 分镜稿页这个批次的开关："opt" = 正在看 AI 稿，空 = 看手写分镜稿（随文稿保存）
+    #[serde(skip_serializing_if = "String::is_empty")]
+    mode: String,
+    /// 最近一次改动这个批次（文字 / 名字 / AI 稿）的时间：打开项目时自动回到最近编辑的那个批次
+    #[serde(rename = "editedAt", skip_serializing_if = "is_zero")]
+    edited_at: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// 关联的剧本片段。不存字符位置（剧本改动后位置会变），而是存「去掉空白和 Markdown 标记后的文字」
@@ -295,8 +329,84 @@ fn blank_doc() -> Doc {
     Doc { id: new_id(), updated_at: now_ms(), ..Default::default() }
 }
 
+/// 分镜稿里的资产引用：「@名称」+ 看不见的资产 id（U+2060/2061/2062/2064 当四进制数字，U+2063 做首尾分隔）+ 占位空格。前端同样的规则在 mentions.js
+const ID_MARK: char = '\u{2063}';
+fn is_id_digit(c: char) -> bool {
+    matches!(c, '\u{2060}' | '\u{2061}' | '\u{2062}' | '\u{2064}')
+}
+fn decode_id(ds: &[char]) -> String {
+    let val = |c: char| match c {
+        '\u{2060}' => 0u32,
+        '\u{2061}' => 1,
+        '\u{2062}' => 2,
+        _ => 3,
+    };
+    ds.chunks(4)
+        .filter(|c| c.len() == 4)
+        .filter_map(|c| char::from_u32(val(c[0]) * 64 + val(c[1]) * 16 + val(c[2]) * 4 + val(c[3])))
+        .collect()
+}
+
+/// 把引用换成资产当前的名字「@名称 」，并去掉所有看不见的 id（导出用）
+fn plain_mentions(text: &str, assets: &[Asset]) -> String {
+    let cs: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '@' {
+            let mut j = i + 1;
+            while j < cs.len() && !cs[j].is_whitespace() && cs[j] != '@' && cs[j] != ID_MARK {
+                j += 1;
+            }
+            if j < cs.len() && cs[j] == ID_MARK {
+                let mut k = j + 1;
+                while k < cs.len() && is_id_digit(cs[k]) {
+                    k += 1;
+                }
+                if k < cs.len() && cs[k] == ID_MARK {
+                    let id = decode_id(&cs[j + 1..k]);
+                    let name: String = match assets.iter().find(|a| a.id == id) {
+                        Some(a) => a.name.clone(),
+                        None => cs[i + 1..j].iter().collect(),
+                    };
+                    out.push('@');
+                    out.push_str(&name);
+                    out.push(' ');
+                    i = k + 1;
+                    while i < cs.len() && cs[i] == '\u{2003}' {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        if c == ID_MARK {
+            // 孤立的 id 残留：跳过到下一个分隔符
+            let mut k = i + 1;
+            while k < cs.len() && is_id_digit(cs[k]) {
+                k += 1;
+            }
+            i = if k < cs.len() && cs[k] == ID_MARK { k + 1 } else { i + 1 };
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 fn count_chars(s: &str) -> usize {
-    s.chars().filter(|c| !c.is_whitespace()).count()
+    let mut n = 0;
+    let mut in_id = false;
+    for c in s.chars() {
+        if c == ID_MARK {
+            in_id = !in_id;
+        } else if !in_id && !c.is_whitespace() && !is_id_digit(c) {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// 名称留空时取剧本第一行的前 20 个字
@@ -367,7 +477,7 @@ fn with_store<R>(write: bool, f: impl FnOnce(&mut StoreFile) -> R) -> Result<R, 
     // 旧数据：整块的 board 文字 → 迁移成一个批次（之后 board 不再写出）
     for d in store.docs.iter_mut() {
         if d.blocks.is_empty() && !d.board.trim().is_empty() {
-            d.blocks.push(Block { id: new_id(), title: String::new(), text: std::mem::take(&mut d.board), link: None, optimized: String::new() });
+            d.blocks.push(Block { id: new_id(), title: String::new(), text: std::mem::take(&mut d.board), link: None, optimized: String::new(), mode: String::new(), edited_at: 0 });
             dirty = true;
         } else if !d.board.is_empty() {
             d.board.clear();
@@ -774,7 +884,7 @@ fn board_markdown(d: &Doc) -> String {
                     part.push(format!("> 对应剧本：{}", l.preview.trim()));
                 }
             }
-            part.push(if b.text.trim().is_empty() { "（空）".to_string() } else { b.text.trim().to_string() });
+            part.push(if b.text.trim().is_empty() { "（空）".to_string() } else { plain_mentions(&b.text, &d.assets).trim().to_string() });
             if !b.optimized.trim().is_empty() {
                 part.push("**AI 优化稿：**".to_string());
                 part.push(b.optimized.trim().to_string());
@@ -817,6 +927,23 @@ fn safe_file_stem(s: &str) -> String {
     let cleaned = cleaned.trim().trim_matches('.').trim().to_string();
     let cleaned: String = cleaned.chars().take(60).collect();
     if cleaned.is_empty() { "分镜稿".into() } else { cleaned }
+}
+
+/// 把一段文本存成 exports 文件夹里的 .txt（重名自动加序号）
+#[tauri::command]
+fn export_text(name: String, text: String) -> Result<Value, String> {
+    let dir = exe_dir().join("exports");
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建导出文件夹：{e}"))?;
+    let stem = safe_file_stem(&name);
+    let mut path = dir.join(format!("{stem}.txt"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem} ({n}).txt"));
+        n += 1;
+    }
+    fs::write(&path, text).map_err(|e| format!("写入导出文件失败：{e}"))?;
+    let file = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    Ok(json!({ "path": format!("exports\\{file}"), "fullPath": path.to_string_lossy() }))
 }
 
 #[tauri::command]
@@ -1154,30 +1281,80 @@ impl AiSink<'_> {
     }
 }
 
-/// 调用 /chat/completions 并把流式结果逐段交给 `emit`（chunk / done / error）。
-/// `cancelled` 为真时悄悄退出（用户点了停止）。和 Tauri 无关，所以可以单独测试。
+/// 一次请求的结果：完成 / 失败（错误已经发给界面）/ 可以重试（原因，是不是该先等一小会儿再重试）
+enum Attempt {
+    Done,
+    Failed,
+    Retry(String, bool),
+}
+
+/// 服务端临时性错误（过载、限流、内部错误）：重试通常就好
+fn transient_error(v: &Value) -> bool {
+    let code = v.pointer("/error/code").and_then(|x| x.as_u64()).unwrap_or(0);
+    let status = v.pointer("/error/status").and_then(|x| x.as_str()).unwrap_or("");
+    code == 429 || (500..=599).contains(&code) || matches!(status, "UNAVAILABLE" | "RESOURCE_EXHAUSTED" | "INTERNAL" | "DEADLINE_EXCEEDED")
+}
+
+const MAX_AUTO_RETRY: u32 = 2;
+
+/// 调用 /chat/completions 并把流式结果交给 emit。连不上、被代理掐断、服务端过载这类临时性问题自动重试（最多 MAX_AUTO_RETRY 次）：
+/// 重试是整份重新生成（不是续传），重试前发一个 retry 事件，界面据此清掉上一次的半截输出
 fn stream_chat(cfg: &AiCfg, body: &Value, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(Value)) {
+    let mut attempt = 0;
+    loop {
+        match stream_once(cfg, body, cancelled, &mut *emit) {
+            Attempt::Done | Attempt::Failed => return,
+            Attempt::Retry(msg, backoff) => {
+                if cancelled() {
+                    return;
+                }
+                if attempt >= MAX_AUTO_RETRY {
+                    emit(json!({ "type": "error", "message": format!("{msg}（已自动重试 {MAX_AUTO_RETRY} 次，仍然失败）") }));
+                    return;
+                }
+                attempt += 1;
+                emit(json!({ "type": "retry", "attempt": attempt, "max": MAX_AUTO_RETRY, "reason": msg }));
+                if backoff {
+                    std::thread::sleep(Duration::from_millis(1500)); // 服务端过载 / 限流：稍等一下再来
+                }
+            }
+        }
+    }
+}
+
+fn stream_once(cfg: &AiCfg, body: &Value, cancelled: &dyn Fn() -> bool, emit: &mut dyn FnMut(Value)) -> Attempt {
     let resp = match prepare_request(cfg, true).send_json(body) {
         Ok(r) => r,
         Err(e) => {
-            emit(json!({ "type": "error", "message": describe_error(e) }));
-            return;
+            // 连不上 / 被掐断（Transport）和服务端过载、限流、内部错误（429 / 5xx）值得重试；地址、Key、请求本身有问题（400 / 401 / 403 / 404）重试没用
+            let retry: Option<bool> = match &e {
+                ureq::Error::Status(code, _) => if *code == 429 || *code >= 500 { Some(true) } else { None },
+                ureq::Error::Transport(_) => Some(false),
+            };
+            let msg = describe_error(e);
+            return match retry {
+                Some(backoff) => Attempt::Retry(msg, backoff),
+                None => {
+                    emit(json!({ "type": "error", "message": msg }));
+                    Attempt::Failed
+                }
+            };
         }
     };
 
     let mut sink = AiSink { emit, filter: ThinkFilter::default(), started: false, any: false };
+    let mut finish: Option<String> = None; // 服务端给的结束原因（stop / length …）
+    let mut saw_done = false;
+    let mut saw_data = false;
     let mut raw = String::new(); // 不是 SSE（服务端没按流式返回）时，把整段 JSON 攒起来
     let reader = BufReader::new(resp.into_reader());
     for line in reader.lines() {
         if cancelled() {
-            return;
+            return Attempt::Failed;
         }
         let line = match line {
             Ok(l) => l,
-            Err(e) => {
-                (sink.emit)(json!({ "type": "error", "message": format!("读取模型输出时中断：{e}") }));
-                return;
-            }
+            Err(e) => return Attempt::Retry(format!("读取模型输出时中断：{e}"), false),
         };
         let t = line.trim();
         if t.is_empty() || t.starts_with(':') || t.starts_with("event:") || t.starts_with("id:") {
@@ -1186,12 +1363,20 @@ fn stream_chat(cfg: &AiCfg, body: &Value, cancelled: &dyn Fn() -> bool, emit: &m
         if let Some(payload) = t.strip_prefix("data:") {
             let payload = payload.trim();
             if payload == "[DONE]" {
+                saw_done = true;
                 break;
             }
             let Ok(v) = serde_json::from_str::<Value>(payload) else { continue };
+            saw_data = true;
+            if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
+                finish = Some(fr.to_string());
+            }
             if let Some(msg) = error_of(&v) {
+                if transient_error(&v) {
+                    return Attempt::Retry(format!("模型返回错误：{msg}"), true);
+                }
                 (sink.emit)(json!({ "type": "error", "message": format!("模型返回错误：{msg}") }));
-                return;
+                return Attempt::Failed;
             }
             if let Some(text) = reasoning_of(&v) {
                 sink.think(&text);
@@ -1205,16 +1390,24 @@ fn stream_chat(cfg: &AiCfg, body: &Value, cancelled: &dyn Fn() -> bool, emit: &m
         }
     }
     if cancelled() {
-        return;
+        return Attempt::Failed;
     }
-    if !sink.any && !raw.trim().is_empty() {
-        // 服务端忽略了 stream:true，直接给了完整 JSON
+    if !raw.trim().is_empty() {
+        // 不是 data: 开头的内容：服务端忽略了 stream:true 直接给了完整 JSON，或者（Gemini 常见）输出到一半插进来一段错误 JSON（503 UNAVAILABLE 等，是个数组）
         if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+            let v = if v.is_array() { v.get(0).cloned().unwrap_or(Value::Null) } else { v };
             if let Some(msg) = error_of(&v) {
-                (sink.emit)(json!({ "type": "error", "message": format!("模型返回错误：{msg}") }));
-                return;
+                let status = v.pointer("/error/status").and_then(|x| x.as_str()).unwrap_or("");
+                if transient_error(&v) {
+                    return Attempt::Retry(format!("模型返回错误：{msg}（{status}）。服务端暂时过载或限流"), true);
+                }
+                let note = if sink.any { "已生成的部分不完整，没有存进批次。" } else { "" };
+                (sink.emit)(json!({ "type": "error", "message": format!("模型返回错误：{msg}（{status}）。{note}") }));
+                return Attempt::Failed;
             }
-            if let Some(text) = content_of(&v) {
+            if sink.any {
+                // 有正常的内容，剩下的零碎行不是错误，忽略
+            } else if let Some(text) = content_of(&v) {
                 sink.feed(&text);
             }
         }
@@ -1222,9 +1415,29 @@ fn stream_chat(cfg: &AiCfg, body: &Value, cancelled: &dyn Fn() -> bool, emit: &m
     sink.finish();
     if !sink.any {
         (sink.emit)(json!({ "type": "error", "message": "模型没有返回任何内容。请确认模型名正确，并且这个接口支持 /chat/completions" }));
-        return;
+        return Attempt::Failed;
     }
-    (sink.emit)(json!({ "type": "done" }));
+    if let Some((msg, retryable)) = incomplete_reason(finish.as_deref(), saw_done, saw_data) {
+        if retryable {
+            return Attempt::Retry(msg, false);
+        }
+        (sink.emit)(json!({ "type": "error", "message": msg }));
+        return Attempt::Failed;
+    }
+    (sink.emit)(json!({ "type": "done", "finish": finish.unwrap_or_default() }));
+    Attempt::Done
+}
+
+/// 输出是不是完整结束的：被长度限制截断、被安全策略拦截、连接中途断了（既没有结束原因也没有 [DONE]），都不能算「已完成」。
+/// 返回 (提示, 能不能靠重试解决)：只有连接中途断开才值得自动重试
+fn incomplete_reason(finish: Option<&str>, saw_done: bool, saw_data: bool) -> Option<(String, bool)> {
+    match finish {
+        Some("length") | Some("max_tokens") => Some(("输出被截断：模型达到了最大输出长度，内容不完整（没有存进批次）。可以换一个输出更长的模型，或精简额外要求后重试".to_string(), false)),
+        Some("content_filter") | Some("safety") => Some(("输出被模型的安全策略拦截，内容不完整（没有存进批次）".to_string(), false)),
+        Some(_) => None,
+        None if saw_data && !saw_done => Some(("连接中途断开了，输出不完整（服务端没有正常结束这次输出，没有存进批次）。多半是网络或代理在中途把连接掐断了，不是模型忙".to_string(), true)),
+        None => None,
+    }
 }
 
 fn run_ai(app: AppHandle, cfg: AiCfg, gen: u64, message: String, images: Vec<ImageRef>) {
@@ -1387,6 +1600,7 @@ pub fn run() {
             doc_open,
             doc_delete,
             doc_export,
+            export_text,
             asset_add,
             asset_data,
             asset_rename,
@@ -1532,6 +1746,21 @@ mod tests {
     }
 
     #[test]
+    fn preset_keeps_a_basket_of_models() {
+        let v = json!({ "presets": [{ "id": "a", "name": "x", "baseUrl": "u", "model": "m2", "models": ["m1", " m1 ", "", "m3"], "apiKey": "", "temperature": 0.3 }], "activePreset": "a" });
+        let out = settings_json(&v);
+        assert_eq!(out["model"], "m2");
+        assert_eq!(out["presets"][0]["models"], json!(["m2", "m1", "m3"]));
+    }
+
+    #[test]
+    fn prefs_keep_only_booleans() {
+        let out = settings_json(&json!({ "prefs": { "wheelSwitch": false, "chipPeek": true, "bad": "x", "n": 3 } }));
+        assert_eq!(out["prefs"], json!({ "wheelSwitch": false, "chipPeek": true }));
+        assert_eq!(settings_json(&json!({}))["prefs"], json!({}));
+    }
+
+    #[test]
     fn presets_mirror_the_active_one_to_top_level() {
         let v = json!({
             "presets": [
@@ -1563,7 +1792,7 @@ mod tests {
         .unwrap();
         let mut d = old.docs[0].clone();
         assert!(d.blocks.is_empty() && !d.board.is_empty());
-        d.blocks.push(Block { id: "b1".into(), title: String::new(), text: std::mem::take(&mut d.board), link: None, optimized: String::new() });
+        d.blocks.push(Block { id: "b1".into(), title: String::new(), text: std::mem::take(&mut d.board), link: None, optimized: String::new(), mode: String::new(), edited_at: 0 });
         assert_eq!(d.blocks[0].text, "镜头1｜全景");
         let out = serde_json::to_value(&d).unwrap();
         assert!(out.get("board").is_none(), "迁移后不再写出 board");
@@ -1571,11 +1800,34 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_output_is_not_done() {
+        assert!(incomplete_reason(Some("stop"), true, true).is_none());
+        assert!(incomplete_reason(Some("stop"), false, true).is_none());
+        assert!(incomplete_reason(Some("length"), true, true).unwrap().0.contains("截断"));
+        assert!(incomplete_reason(Some("content_filter"), true, true).unwrap().0.contains("拦截"));
+        let (msg, retry) = incomplete_reason(None, false, true).unwrap();
+        assert!(msg.contains("中途断开") && retry);
+        assert!(!incomplete_reason(Some("length"), true, true).unwrap().1);
+        assert!(incomplete_reason(None, true, true).is_none());
+        assert!(incomplete_reason(None, false, false).is_none());
+    }
+
+    #[test]
+    fn plain_mentions_uses_current_asset_name() {
+        // id「ab」= 'a'(0x61)→ 1,2,0,1  'b'(0x62)→ 1,2,0,2
+        let enc = "\u{2063}\u{2061}\u{2062}\u{2060}\u{2061}\u{2061}\u{2062}\u{2060}\u{2062}\u{2063}";
+        let assets = vec![Asset { id: "ab".into(), name: "新名字".into(), ..Default::default() }];
+        let text = format!("镜头1 @旧名字{enc}\u{2003}\u{2003}冲出去，@没有id的");
+        assert_eq!(plain_mentions(&text, &assets), "镜头1 @新名字 冲出去，@没有id的");
+        assert_eq!(count_chars(&text), count_chars("镜头1@旧名字冲出去，@没有id的"));
+    }
+
+    #[test]
     fn board_markdown_lists_blocks_and_links() {
         let d = Doc {
             blocks: vec![
-                Block { id: "1".into(), title: "冲出峡口".into(), text: "镜头01".into(), link: Some(ScriptLink { quote: "q".into(), nth: 0, preview: "866沿着旧路".into() }), optimized: String::new() },
-                Block { id: "2".into(), title: String::new(), text: "镜头02".into(), link: None, optimized: String::new() },
+                Block { id: "1".into(), title: "冲出峡口".into(), text: "镜头01".into(), link: Some(ScriptLink { quote: "q".into(), nth: 0, preview: "866沿着旧路".into() }), optimized: String::new(), mode: String::new(), edited_at: 0 },
+                Block { id: "2".into(), title: String::new(), text: "镜头02".into(), link: None, optimized: String::new(), mode: String::new(), edited_at: 0 },
             ],
             ..Default::default()
         };
@@ -1693,7 +1945,10 @@ Connection: close
     fn reports_connection_refused() {
         // 端口 1 基本不会有服务
         let events = collect(&cfg_for("http://127.0.0.1:1/v1".into()));
-        assert_eq!(events[0]["type"], "error");
-        assert!(events[0]["message"].as_str().unwrap().contains("无法连接"));
+        // 连不上属于临时性问题：先自动重试两次（发两个 retry 事件），仍然失败才报错
+        let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["retry", "retry", "error"]);
+        let msg = events[2]["message"].as_str().unwrap();
+        assert!(msg.contains("无法连接") && msg.contains("自动重试"), "{msg}");
     }
 }

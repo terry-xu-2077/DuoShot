@@ -3,11 +3,73 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { fetchDevSettings, runDevAi, testDevAi, DEV_KEY_MASK } from './devAi.js'
+import { stripIdMarks, plainMentions } from './mentions.js'
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
 // ---------- 公共小工具（前端与 mock 共用；Rust 侧以后按同样规则实现） ----------
-export const countChars = (s) => [...(s || '').replace(/\s/g, '')].length
+export const countChars = (s) => [...stripIdMarks(s).replace(/\s/g, '')].length
+
+// 从分镜稿文字里识别时长并求和：10s / 10S / 2.5s / 10秒 / 10 秒 / 10秒钟 / 10sec / 十秒 / 二十五秒。
+// 前面紧挨着字母或数字的不算（比如 "ms"、"4K60s" 之外的杂项），"3-5s" 这类区间只认最后的 5s
+const ZH_DIGIT = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 }
+const zhToNum = (t) => {
+  if (!t.includes('十')) return t.length === 1 ? ZH_DIGIT[t] : NaN
+  const [a, b] = t.split('十')
+  const tens = a === '' ? 1 : ZH_DIGIT[a]
+  const ones = b === '' ? 0 : ZH_DIGIT[b]
+  return tens === undefined || ones === undefined ? NaN : tens * 10 + ones
+}
+// 文字里所有「N秒」的写法：[{ at: 位置, sec: 秒数, rel: 是不是「N秒后 / 之后 / 内」这类镜头内的时间点 }]，按位置排序
+const REL_AFTER = /^\s*(?:之?后|以?内|里|时|钟后)/
+const secondTokens = (text) => {
+  const out = []
+  const push = (m, sec) => {
+    if (!Number.isFinite(sec)) return
+    out.push({ at: m.index, sec, rel: REL_AFTER.test(text.slice(m.index + m[0].length)) })
+  }
+  for (const m of text.matchAll(/(?<![A-Za-z\d.])(\d+(?:\.\d+)?)[ \t]*(?:秒钟?|sec(?:onds?)?(?![A-Za-z])|s(?![A-Za-z]))/gi)) push(m, parseFloat(m[1]))
+  for (const m of text.matchAll(/([一二两三四五六七八九十]{1,3})\s*秒钟?/g)) push(m, zhToNum(m[1]))
+  return out.sort((a, b) => a.at - b.at)
+}
+// 镜头开头：行首的「镜头1 / 镜头04 / 镜头四」（允许前面有 # * - 序号 空格）
+const SHOT_HEAD = /^[ \t#>*\-\d.、]*镜头\s*(\d+|[一二两三四五六七八九十]+)/gm
+
+// 按镜头统计时长：每个镜头只取它里面的第一个秒数（如「镜头四，3秒，…1.5秒后，车停下来了」= 3 秒，1.5 秒是镜头内的时间点，不累加）。
+// 返回 { total, shots: [{ label, sec }] }；没有任何镜头开头时，退回「把所有秒数相加」（排除「N秒后」这类时间点）
+export const shotDurations = (s) => {
+  const text = s || ''
+  const heads = [...text.matchAll(SHOT_HEAD)]
+  const tokens = secondTokens(text)
+  if (!heads.length) {
+    const sec = tokens.filter((t) => !t.rel).reduce((n, t) => n + t.sec, 0)
+    return { total: Math.round(sec * 10) / 10, shots: [] }
+  }
+  const shots = heads.map((h, i) => {
+    const from = h.index
+    const to = i + 1 < heads.length ? heads[i + 1].index : text.length
+    const hit = tokens.find((t) => !t.rel && t.at >= from && t.at < to)
+    return { label: `镜头${h[1]}`, sec: hit ? hit.sec : 0 }
+  })
+  return { total: Math.round(shots.reduce((n, x) => n + x.sec, 0) * 10) / 10, shots }
+}
+export const countSeconds = (s) => shotDurations(s).total
+// AI 稿的时长：优先取「建议生成时长：X秒」；没有就取镜头时间码 [0–3.5s] 里最大的结束时间；都没有再按普通文字识别
+export const aiSeconds = (s) => {
+  const text = s || ''
+  const rec = [...text.matchAll(/建议生成时长\s*[:：]\s*\**\s*(\d+(?:\.\d+)?)\s*(?:秒|s)/gi)]
+  if (rec.length) return Math.round(rec.reduce((n, m) => n + parseFloat(m[1]), 0) * 10) / 10
+  let end = 0
+  for (const m of text.matchAll(/\[\s*(\d+(?:\.\d+)?)\s*[-–—~～]\s*(\d+(?:\.\d+)?)\s*s?\s*\]/gi)) end = Math.max(end, parseFloat(m[2]))
+  return end || countSeconds(text)
+}
+export const fmtSeconds =(sec) => {
+  const t = Math.round(sec * 10) / 10
+  if (t < 60) return `${t} 秒`
+  const m = Math.floor(t / 60)
+  const r = Math.round((t - m * 60) * 10) / 10
+  return `${m} 分 ${r} 秒`
+}
 
 export function draftTitle(d) {
   const t = (d.title || '').trim()
@@ -23,6 +85,9 @@ export const fmtShort = (ms) => { const d = new Date(ms); return `${pad(d.getMon
 // 「2026年11月15日 16:32」
 export const fmtFullDate = (ms) => { const t = new Date(ms); return `${t.getFullYear()}年${t.getMonth() + 1}月${t.getDate()}日 ${pad(t.getHours())}:${pad(t.getMinutes())}` }
 
+// 「使用习惯」设置：都是开关，默认全开。存在 settings.json 的 prefs 里
+export const DEFAULT_PREFS = { wheelSwitch: true, chipPeek: true, resumeLastBatch: true, enterToSend: true }
+export const prefsOf = (s) => ({ ...DEFAULT_PREFS, ...((s && s.prefs) || {}) })
 export const DEFAULT_SETTINGS = { baseUrl: 'http://127.0.0.1:11434/v1', model: '', apiKey: '', temperature: 0.3 }
 export const aiConfigured = (s) => !!(s && s.baseUrl && s.baseUrl.trim() && s.model && s.model.trim())
 
@@ -36,6 +101,7 @@ const ROUTES = {
   'doc:open': ['doc_open', (a) => ({ id: a[0] })],
   'doc:delete': ['doc_delete', (a) => ({ id: a[0] })],
   'doc:export': ['doc_export', (a) => ({ id: a[0] })],
+  'text:export': ['export_text', (a) => ({ name: a[0], text: a[1] })],
   'asset:add': ['asset_add', (a) => ({ docId: a[0], name: a[1], dataUrl: a[2], thumbDataUrl: a[3] || null })],
   'asset:addRef': ['asset_add_ref', (a) => ({ docId: a[0], path: a[1], thumbDataUrl: a[2] })],
   'asset:readPath': ['asset_read_path', (a) => ({ path: a[0] })],
@@ -142,7 +208,7 @@ const boardMarkdown = (d) => {
   return blocks.map((b, i) => [
     `### ${String(i + 1).padStart(2, '0')}${(b.title || '').trim() ? ` ${b.title.trim()}` : ''}`,
     ...(b.link && (b.link.preview || '').trim() ? [`> 对应剧本：${b.link.preview.trim()}`] : []),
-    (b.text || '').trim() || '（空）',
+    plainMentions(b.text || '', d.assets || []).trim() || '（空）',
     ...((b.optimized || '').trim() ? ['**AI 优化稿：**', b.optimized.trim()] : []),
   ].join('\n\n')).join('\n\n')
 }
@@ -171,11 +237,13 @@ async function currentSettings() {
     base.model = file.model || ''
     base.temperature = file.temperature
     base.apiKey = file.hasKey ? DEV_KEY_MASK : ''
-    presets = (file.presets || []).map((p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, model: p.model, temperature: p.temperature, apiKey: p.hasKey ? DEV_KEY_MASK : '' }))
+    presets = (file.presets || []).map((p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl, model: p.model, models: p.models || [], temperature: p.temperature, apiKey: p.hasKey ? DEV_KEY_MASK : '' }))
     activePreset = file.activePreset || ''
   }
   const local = read(LS.set, null)
+  let prefs = {}
   if (local) {
+    prefs = local.prefs || {}
     if (Array.isArray(local.presets)) {
       // 预览里改过预设：整份用预览里的（没改过的 Key 仍是「沿用绿色版」，由开发服务器按预设 id 补上）
       presets = local.presets
@@ -188,7 +256,7 @@ async function currentSettings() {
   if (!presets.length && (base.model || base.apiKey)) presets = [{ id: 'default', name: '默认', baseUrl: base.baseUrl, model: base.model, temperature: base.temperature, apiKey: base.apiKey }]
   const active = presets.find((p) => p.id === activePreset) || presets[0]
   if (active) { base.baseUrl = active.baseUrl || base.baseUrl; base.model = active.model; base.temperature = active.temperature; base.apiKey = active.apiKey }
-  return { ...base, presets, activePreset: active ? active.id : '' }
+  return { ...base, presets, activePreset: active ? active.id : '', prefs }
 }
 
 function mockOptimized(board) {
@@ -305,6 +373,15 @@ const mock = {
           putDocs(docs)
         }
         return { assets: doc?.assets || [] }
+      }
+      case 'text:export': {
+        const name = ((a[0] || '').replace(/[\\/:*?"<>|]/g, '_') || '分镜稿') + '.txt'
+        const url = URL.createObjectURL(new Blob([a[1] || ''], { type: 'text/plain;charset=utf-8' }))
+        const link = document.createElement('a')
+        link.href = url; link.download = name
+        document.body.appendChild(link); link.click(); link.remove()
+        setTimeout(() => URL.revokeObjectURL(url), 2000)
+        return { path: name }
       }
       case 'doc:export': {
         const d = (getDocs() || []).find((x) => x.id === a[0])

@@ -5,11 +5,14 @@ import Dropdown from './Dropdown.jsx'
 // 「AI优化」标签页：只是跟 AI 沟通的界面（底部填额外要求、点开始 / 停止，生成过程在这里实时显示）。
 // AI 一次只处理「分镜稿」里当前选中的那个批次；优化完的结果存进这个批次，在分镜稿页顶上切到「AI优化稿」查看。
 // 你手写的分镜稿永远不会被改动。
-export default function AiPanel({ ai, batch, runningFor, refs, setExtra, onStart, onStop, presets = [], activePreset = '', onPreset }) {
+export default function AiPanel({ ai, batch, runningFor, refs, setExtra, onStart, onStop, presets = [], activePreset = '', onPreset, enterToSend = true }) {
   const bodyRef = useRef(null)
   const thinkRef = useRef(null)
   const { phase, text, error, extra } = ai
   const think = ai.think || ''
+  const sent = ai.sent || ''
+  const sentImages = ai.sentImages || []
+  const [sentOpen, setSentOpen] = useState(false)   // 提交内容默认折叠
   const running = phase === 'running'
   const hasResult = !!text
   // 思考过程：模型在想的时候自动展开，正文一开始出来就自动收起；你点过标题以后就按你点的来（下次优化重新自动）
@@ -46,6 +49,16 @@ export default function AiPanel({ ai, batch, runningFor, refs, setExtra, onStart
               ? <>当前批次：<b>{batch.num}{batch.title ? ` · ${batch.title}` : ''}</b>{batch.hasOpt && phase !== 'running' ? '（已有优化稿，重新优化会覆盖它）' : ''}</>
               : '还没有批次：先到「分镜稿」新建一个批次。'}
         </div>
+        {sent && (
+          <div className={`ai-think ai-sent${sentOpen ? ' open' : ''}`}>
+            <button className="ai-think-head" onClick={() => setSentOpen((v) => !v)} aria-expanded={sentOpen}>
+              <span className="ai-think-title">提交给 API 的内容</span>
+              <span className="ai-think-meta">{sent.length.toLocaleString()} 字{sentImages.length ? ` · 附 ${sentImages.length} 张图` : ''}</span>
+              <span className="ai-think-chev"><IconChevron size={16} /></span>
+            </button>
+            {sentOpen && <div className="ai-think-body ai-sent-body">{sent}<div className="ai-sent-note">{sentImages.length ? `随文字附带的图片：${sentImages.join('、')}。系统提示词是内置的，不在这里。` : '系统提示词是内置的，不在这里。'}</div></div>}
+          </div>
+        )}
         {think && (
           <div className={`ai-think${thinkShown ? ' open' : ''}${running && !hasResult ? ' live' : ''}`}>
             <button className="ai-think-head" onClick={() => setThinkOpen(!thinkShown)} aria-expanded={thinkShown}>
@@ -58,7 +71,12 @@ export default function AiPanel({ ai, batch, runningFor, refs, setExtra, onStart
         )}
         {hasResult && <pre className="ai-text">{text}{running && <span className="caret" />}</pre>}
 
-        {!hasResult && running && !think && <div className="ai-wait">正在连接模型，等待第一段输出…</div>}
+        {!hasResult && running && !think && (
+          <div className="ai-wait">
+            {ai.retry ? `连接中断了，正在自动重试并重新生成（第 ${ai.retry} 次重试）…` : '正在连接模型，等待第一段输出…'}
+            {ai.retry && ai.retryReason ? <div className="ai-wait-why">{ai.retryReason}</div> : null}
+          </div>
+        )}
 
         {!hasResult && !think && !running && phase !== 'error' && (
           <div className="ai-idle-box">
@@ -82,7 +100,7 @@ export default function AiPanel({ ai, batch, runningFor, refs, setExtra, onStart
           </div>
         )}
         {phase === 'stopped' && <div className="ai-note">已停止。上面是已生成的部分（不会存进批次），可以重新优化。</div>}
-        {phase === 'done' && <div className="ai-note">已完成，结果已存进这个批次：在「分镜稿」页顶上切到「AI优化稿」查看。</div>}
+        {phase === 'done' && <div className="ai-note">已完成，结果已存进这个批次：在「分镜稿」页顶上切到「AI优化稿」查看。{ai.finish ? `（模型结束原因：${ai.finish}，共 ${text.length.toLocaleString()} 字）` : ''}</div>}
       </div>
 
       <div className="ai-composer">
@@ -112,9 +130,9 @@ export default function AiPanel({ ai, batch, runningFor, refs, setExtra, onStart
         rows={2}
         value={extra}
         onChange={(e) => setExtra(e.target.value)}
-        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !running) { e.preventDefault(); onStart() } }}
+        onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && !running && (enterToSend ? !e.shiftKey : (e.ctrlKey || e.metaKey))) { e.preventDefault(); onStart() } }}
         disabled={running}
-        placeholder="额外要求（可选），例如：总时长压到 12 秒、第二镜改成手持跟拍"
+        placeholder={`额外要求（可选），例如：总时长压到 12 秒、第二镜改成手持跟拍（${enterToSend ? "回车" : "Ctrl+回车"}开始优化）`}
       />
       <div className="ai-bar">
         {presets.length > 1 && (

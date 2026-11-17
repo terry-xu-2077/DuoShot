@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, isMock, aiConfigured, countChars, draftTitle, fmtClock, fmtShort } from './api.js'
+import { api, isMock, aiConfigured, countChars, prefsOf, countSeconds, shotDurations, aiSeconds, fmtSeconds, draftTitle, fmtClock, fmtShort } from './api.js'
 import WinControls from './components/WinControls.jsx'
 import AiPanel from './components/AiPanel.jsx'
 import Home from './components/Home.jsx'
 import BoardEditor from './components/BoardEditor.jsx'
 import ConfirmDialog from './components/ConfirmDialog.jsx'
-import MarkedTextarea, { MENTION_GAP } from './components/MarkedTextarea.jsx'
+import MarkedTextarea from './components/MarkedTextarea.jsx'
+import { MENTION_GAP, mentionToken, plainMentions, upgradeMentions } from './mentions.js'
+import { boardExportText } from './boardExport.js'
 import AssetLibrary from './components/AssetLibrary.jsx'
 import MarkdownView from './components/MarkdownView.jsx'
 import BlockBar from './components/BlockBar.jsx'
@@ -14,7 +16,7 @@ import { resolveAnchor, sameAnchor } from './anchor.js'
 import { isImageFile, prepareImage, makeThumb, shrinkForAi } from './assetImage.js'
 import { readTextFile, fileTitle } from './readFile.js'
 import SettingsModal from './components/SettingsModal.jsx'
-import { IconGear, IconCopy, IconClose, IconStar4, IconClock, IconChevron, IconPencil, IconHome } from './components/Icons.jsx'
+import { IconGear, IconCopy, IconClose, IconStar4, IconClock, IconChevron, IconHome } from './components/Icons.jsx'
 
 const SAVE_DELAY = 400      // 输入停顿后，把改动直接覆盖保存到当前这份分镜稿
 
@@ -40,7 +42,7 @@ const blocksText = (blocks) => (blocks || []).map((b) => b.text || '').join('\n\
 // 批次 / 对应的剧本片段（只有固定了选区才发；没固定就不发剧本）/ 上一批次的优化稿（衔接连续性）/ 参考图清单 / 手写的分镜稿 / 额外要求。
 // 参考图本身随请求附在文字后面，顺序与清单一致。
 function buildAiMessage({ script, blocks, target, assets, refs, extra }) {
-  const fixGap = (txt) => assets.reduce((t, a) => t.split(`@${a.name}${MENTION_GAP}`).join(`@${a.name} `), txt || '')   // 标签占位的全角空格换回普通空格
+  const fixGap = (txt) => assets.reduce((t, a) => t.split(`@${a.name}${MENTION_GAP}`).join(`@${a.name} `), plainMentions(txt || '', assets))   // 引用先换成资产当前的名字（引用靠 id 认，改过名也对得上）   // 标签占位的全角空格换回普通空格
   const idx = blocks.findIndex((b) => b.id === target.id)
   const num = String(idx + 1).padStart(2, '0')
   const parts = [`【批次】第 ${num} 个批次${target.title.trim() ? `，名称：${target.title.trim()}` : '（还没有起名）'}`]
@@ -58,8 +60,9 @@ const PHASE_LABEL ={ running: '生成中', done: '已完成', stopped: '已停�
 
 // 分镜稿里的「@名称」→ 引用到了资源库里的哪些图（按在分镜稿里第一次出现的顺序），以及找不到对应资产的 @名称。
 // 名称有长有短（@林舟 / @林舟_2），先按长名字匹配并把命中的部分抹掉，避免短名字误认。
-function resolveMentions(board, assets) {
-  let rest = board || ''
+function resolveMentions(rawBoard, assets) {
+  const board = plainMentions(rawBoard || '', assets)
+  let rest = board
   const used = []
   for (const a of [...assets].sort((x, y) => y.name.length - x.name.length)) {
     const tag = `@${a.name}`
@@ -117,9 +120,8 @@ export default function App() {
   const [saveInfo, setSaveInfo] = useState({ state: 'idle', at: null })
   const [settings, setSettings] = useState(null)
   const [showSettings, setShowSettings] = useState(false)
-  const [ai, setAi] = useState({ phase: 'idle', text: '', think: '', error: '', extra: '', target: '' })   // target：这次优化针对的批次 id
+  const [ai, setAi] = useState({ phase: 'idle', text: '', think: '', error: '', extra: '', target: '', sent: '', sentImages: [] })   // target：这次优化针对的批次 id
   const [optView, setOptView] = useState('preview')     // AI 稿：preview Markdown 预览 / edit 编辑
-  const [boardMode, setBoardMode] = useState('src')       // 分镜稿页当前批次：src 手写分镜稿 / opt AI 优化稿
   const [confirmDel, setConfirmDel] = useState(null)   // 正在弹窗确认删除的分镜稿 {id, title}
   const [menuOpen, setMenuOpen] = useState(false)      // 分镜稿下拉是否展开
   const menuRef = useRef(null)
@@ -152,6 +154,9 @@ export default function App() {
   const pageRef2 = useRef('home')
 
   const draftRef = useRef(EMPTY)
+  const prefs = prefsOf(settings)
+  const prefsRef = useRef(prefs)   // 使用习惯设置（随时读最新的，不用进依赖）
+  prefsRef.current = prefs
   const aiRef = useRef(ai)
   const saveT = useRef(null)
   const toastT = useRef(null)
@@ -186,10 +191,10 @@ export default function App() {
     const doc = normDoc(raw)
     draftRef.current = doc
     setDraft(doc)
-    setActiveBlockId(doc.blocks[0]?.id || '')
+    // 打开项目：回到最近编辑的那个批次（都没编辑过就是第一个）
+    setActiveBlockId(!prefsRef.current.resumeLastBatch ? (doc.blocks[0]?.id || '') : doc.blocks.reduce((best, b) => ((b.editedAt || 0) > (best?.editedAt || 0) ? b : best), doc.blocks[0])?.id || '')
     setSavedAt(doc.updatedAt || null)
-    setAi((p) => ({ ...p, phase: 'idle', text: '', think: '', error: '', target: '' }))
-    setBoardMode('src')
+    setAi((p) => ({ ...p, phase: 'idle', text: '', think: '', error: '', target: '', sent: '', sentImages: [] }))
     setRightTab('board')
     setScriptView('preview')
   }, [])
@@ -291,6 +296,26 @@ export default function App() {
     } catch (e) { notify(e.message, true) }
   }
 
+  // 复制 / 导出分镜稿：把所有批次拼成一份文本（格式见 boardExport.js）
+  const copyBoard = async () => {
+    setMenuOpen(false)
+    const text = boardExportText(draftRef.current)
+    if (!text.trim()) { notify('还没有可复制的内容：批次里没有分镜稿，也没有 AI 稿', true); return }
+    await copyText(text, '分镜稿文本')
+  }
+
+  const exportBoard = async () => {
+    setMenuOpen(false)
+    const d = draftRef.current
+    const text = boardExportText(d)
+    if (!text.trim()) { notify('还没有可导出的内容：批次里没有分镜稿，也没有 AI 稿', true); return }
+    try {
+      await flushSave()
+      const r = await api.invoke('text:export', `${draftTitle(d)}_分镜稿`, text)
+      notify(`已导出到 ${r.path}`)
+    } catch (e) { notify(`导出失败：${e.message}`, true) }
+  }
+
   // 删除要先弹窗确认
   const askDelete = (id) => {
     setMenuOpen(false)
@@ -321,7 +346,7 @@ export default function App() {
         draftRef.current = EMPTY
         setDraft(EMPTY)
         setSavedAt(null)
-        setAi((p) => ({ ...p, phase: 'idle', text: '', think: '', error: '' }))
+        setAi((p) => ({ ...p, phase: 'idle', text: '', think: '', error: '', sent: '', sentImages: [] }))
         go('home')
       } else if (r.doc.id !== draftRef.current.id) applyDoc(r.doc)
       notify(doneText)
@@ -338,6 +363,9 @@ export default function App() {
   const blocks = draft.blocks || []
   const active = blocks.find((b) => b.id === activeBlockId) || blocks[0] || null
   const activeRef = useRef(null)
+  const modeOf = (blk) => (blk && blk.mode === 'opt' ? 'opt' : 'src')   // 每个批次各自的开关，存在批次的 mode 里，随文稿保存
+  const boardMode = modeOf(active)
+  const setBoardMode = (m, id) => { const k = id || (active && active.id); const b = k && (draftRef.current.blocks || []).find((x) => x.id === k); if (b && modeOf(b) !== m) editBlock(k, { mode: m === 'opt' ? 'opt' : '' }) }
   activeRef.current = active
 
   const commitBlocks = (nextBlocks) => {
@@ -347,8 +375,25 @@ export default function App() {
     scheduleSave(next)
   }
 
+  // 分镜稿里的资产引用靠 id 认（见 mentions.js）：载入时把旧写法（只有「@名称」）补上 id，
+  // 资源库里改了名 / 增删了图，也把文稿里存的名字同步成现在的名字。只在换文稿 / 资源库变化时跑，不在打字时跑（免得打字中途文字被改写）
+  useEffect(() => {
+    const assets = draftRef.current.assets || []
+    const blocks = draftRef.current.blocks || []
+    if (!draftRef.current.id || !assets.length || !blocks.length) return
+    let changed = false
+    const next = blocks.map((b) => {
+      const t = upgradeMentions(b.text || '', assets)
+      if (t === (b.text || '')) return b
+      changed = true
+      return { ...b, text: t }
+    })
+    if (changed) commitBlocks(next)
+  }, [draft.id, draft.assets])   // eslint-disable-line react-hooks/exhaustive-deps
+
   const editBlock = (id, patch) => {
-    commitBlocks((draftRef.current.blocks || []).map((b) => (b.id === id ? { ...b, ...patch } : b)))
+    const touched = 'text' in patch || 'title' in patch || 'optimized' in patch   // 只切开关不算「编辑」
+    commitBlocks((draftRef.current.blocks || []).map((b) => (b.id === id ? { ...b, ...patch, ...(touched ? { editedAt: Date.now() } : {}) } : b)))
   }
 
   // 新建批次：默认不关联剧本（要关联：在剧本里选中一段话，点选区角上的图钉）
@@ -624,7 +669,7 @@ export default function App() {
   // 资源库里勾选了几张图：一次性把它们的「@名称」加到当前批次末尾（没有批次就新建一个）
   const insertAssets = (list) => {
     if (!list.length) return
-    const tokens = list.map((a) => `@${a.name}${MENTION_GAP}`).join('')
+    const tokens = list.map((a) => mentionToken(a)).join('')
     const cur = activeRef.current
     setBoardMode('src')
     setRightTab('board')
@@ -702,9 +747,10 @@ export default function App() {
       if (p.phase !== 'running') return p
       switch (ev.type) {
         case 'chunk': return { ...p, text: p.text + ev.text }
+        case 'retry': return { ...p, text: '', think: '', retry: ev.attempt, retryReason: ev.reason || '' }   // 自动重试：清掉上一次的半截输出，界面显示「正在重试」
         case 'think': return { ...p, think: p.think + ev.text }   // 模型的思考过程，在 AI 页以可折叠的灰色块显示（不存进批次）
         case 'rethink': return { ...p, think: p.think + p.text, text: '' }   // 只有 </think> 没有 <think>：前面当正文收到的其实是思考，挪进思考区
-        case 'done': return { ...p, phase: 'done' }
+        case 'done': return { ...p, phase: 'done', finish: ev.finish || '' }   // finish：服务端给的结束原因（stop 才是正常写完）
         case 'stopped': return { ...p, phase: 'stopped' }
         case 'error': return { ...p, phase: 'error', error: ev.message }
         default: return p
@@ -724,7 +770,7 @@ export default function App() {
       setAi((p) => ({ ...p, phase: 'error', error: '模型把你手写的分镜稿原样返回了，没有做优化，所以没有保存。可以换个模型预设，或在「额外要求」里写明“按分镜脚本大师的格式输出完整提示词”后重试。' }))
       return
     }
-    const next = { ...draftRef.current, blocks: draftRef.current.blocks.map((b) => (b.id === ai.target ? { ...b, optimized: t } : b)) }
+    const next = { ...draftRef.current, blocks: draftRef.current.blocks.map((b) => (b.id === ai.target ? { ...b, optimized: t, editedAt: Date.now() } : b)) }
     draftRef.current = next
     setDraft(next)
     scheduleSave(next)
@@ -787,8 +833,8 @@ export default function App() {
     if (notes.length) notify(notes.join('；'))
     clearTimeout(saveT.current)
     await persist(d).catch(() => { })
-    setAi((p) => ({ ...p, phase: 'running', text: '', think: '', error: '', target: target.id }))
     const message = buildAiMessage({ script: d.script || '', blocks: d.blocks || [], target, assets: d.assets || [], refs: picked, extra: aiRef.current.extra })
+    setAi((p) => ({ ...p, phase: 'running', text: '', think: '', error: '', target: target.id, sent: message, sentImages: images.map((i) => i.name), retry: 0, retryReason: '' }))   // sent：这次提交给 API 的原始文本，AI 页里折叠显示
     try { await api.invoke('ai:start', message, images) }
     catch (e) { setAi((p) => ({ ...p, phase: 'error', error: e.message })) }
   }
@@ -801,7 +847,7 @@ export default function App() {
     const p = (cur?.presets || []).find((x) => x.id === id)
     if (!p) return
     try {
-      const saved = await api.invoke('settings:set', { baseUrl: p.baseUrl, model: p.model, apiKey: p.apiKey, temperature: p.temperature, presets: cur.presets, activePreset: id })
+      const saved = await api.invoke('settings:set', { baseUrl: p.baseUrl, model: p.model, apiKey: p.apiKey, temperature: p.temperature, presets: cur.presets, activePreset: id, prefs: cur.prefs })
       setSettings(saved)
       notify(`已切换到「${p.name}」`)
     } catch (e) { notify(e.message, true) }
@@ -821,7 +867,7 @@ export default function App() {
   const view = rightTab
   const showOptView = view === 'board' && boardMode === 'opt' && !!active
   // AI 优化页只跟「当前选中的批次」打交道：别的批次的上一次结果不在这里显示（正在生成的除外）
-  const aiShown = ai.target && active && ai.target !== active.id && ai.phase !== 'running' ? { ...ai, phase: 'idle', text: '', think: '', error: '' } : ai
+  const aiShown = ai.target && active && ai.target !== active.id && ai.phase !== 'running' ? { ...ai, phase: 'idle', text: '', think: '', error: '', sent: '', sentImages: [] } : ai
   const aiBatch = active ? { num: String(blocks.indexOf(active) + 1).padStart(2, '0'), title: active.title.trim(), hasOpt: !!(active.optimized || '').trim() } : null
   const aiRunningFor = ai.phase === 'running' && active && ai.target !== active.id ? blocks.find((b) => b.id === ai.target) : null
 
@@ -858,47 +904,34 @@ export default function App() {
               <button
                 className="title-caret"
                 onClick={() => setMenuOpen((v) => !v)}
-                aria-haspopup="listbox"
+                aria-haspopup="menu"
                 aria-expanded={menuOpen}
-                title="切换分镜稿"
-                aria-label="切换分镜稿"
+                title="分镜稿操作"
+                aria-label="分镜稿操作"
               >
                 <IconChevron size={22} />
               </button>
               {menuOpen && (
                 <div className="menu-anchor">
-                  <ul className="menu hm-panel" role="listbox">
-                    <li className="menu-head hm-head" aria-hidden="true">分镜稿 <b>{list.length} 份</b></li>
-                    <li className="hm-new" role="option" onClick={newDoc}><span className="plus">＋</span>新建分镜稿</li>
-                    {list.map((h) => (
-                      <li
-                        key={h.id}
-                        role="option"
-                        aria-selected={h.id === draft.id}
-                        className={`menu-item hm-item ${h.id === draft.id ? 'sel' : ''}`}
-                        onClick={() => openDoc(h.id)}
-                      >
-                        <span className="hm-text">
-                          <span className="hm-title">{h.title}</span>
-                          <span className="hm-meta">{fmtShort(h.updatedAt)} · 分镜 {h.boardLen.toLocaleString()} 字</span>
-                        </span>
-                        {(
-                          <button
-                            className="hm-del"
-                            onClick={(e) => { e.stopPropagation(); askDelete(h.id) }}
-                            title="删除这份分镜稿"
-                            aria-label="删除这份分镜稿"
-                          >
-                            <IconClose size={11} />
-                          </button>
-                        )}
-                      </li>
-                    ))}
+                  <ul className="menu hm-panel" role="menu">
+                    <li className="menu-head hm-head" aria-hidden="true">整个分镜稿</li>
+                    <li className="menu-item hm-act" role="menuitem" onClick={copyBoard}>
+                      <span className="hm-text">
+                        <span className="hm-title">复制分镜稿文本</span>
+                        <span className="hm-meta">所有批次拼成一份，复制到剪贴板</span>
+                      </span>
+                    </li>
+                    <li className="menu-item hm-act" role="menuitem" onClick={exportBoard}>
+                      <span className="hm-text">
+                        <span className="hm-title">导出分镜稿文件</span>
+                        <span className="hm-meta">存成 .txt 文件</span>
+                      </span>
+                    </li>
                   </ul>
                 </div>
               )}
               </div>
-              <div className="tag" title="分镜稿字数"><IconPencil size={12} />{countChars(blocksText(draft.blocks)).toLocaleString()} 字</div>
+              <div className="tag" title="所有批次的总时长：每个批次按它自己的开关算，原文的识别 10s、10秒 等写法，AI 稿的取「建议生成时长」"><IconClock size={12} />{fmtSeconds((draft.blocks || []).reduce((n, b) => n + (modeOf(b) === 'opt' ? aiSeconds(b.optimized) : countSeconds(b.text)), 0))}</div>
             </div>
           </div>
         )}
@@ -998,6 +1031,7 @@ export default function App() {
                 )}
                 {view === 'board' && (
                   <BlockBar
+                    wheelSwitch={prefs.wheelSwitch}
                     blocks={blocks}
                     activeId={active?.id || ''}
                     onSelect={selectBlock}
@@ -1049,6 +1083,7 @@ export default function App() {
                 )}
                 {active && (
                   <BoardEditor
+                    peek={prefs.chipPeek}
                     key={`${draft.id}/${active.id}`}
                     ref={boardRef}
                     hidden={view !== 'board' || boardMode === 'opt'}
@@ -1061,6 +1096,17 @@ export default function App() {
                     disabled={!ready}
                   />
                 )}
+                {view === 'board' && active && (() => {
+                  const cur = boardMode === 'opt' ? (active.optimized || '') : (active.text || '')
+                  const shots = boardMode === 'opt' ? [] : shotDurations(cur).shots
+                  const statTitle = boardMode === 'opt' ? '当前批次 AI 稿的字数 / 时长' : shots.length ? ['当前批次分镜稿的字数 / 时长（每个镜头取它里面的第一个秒数）', ...shots.map((x) => x.label + '：' + (x.sec ? x.sec + ' 秒' : '未标时长'))].join(String.fromCharCode(10)) : '当前批次分镜稿的字数 / 时长'
+                  const sec = boardMode === 'opt' ? aiSeconds(cur) : countSeconds(cur)
+                  return (
+                    <div className="board-stat" title={statTitle}>
+                      {countChars(cur).toLocaleString()} 字<i />{sec ? fmtSeconds(sec) : '未标时长'}
+                    </div>
+                  )
+                })()}
                 {view === 'lib' && (
                   <AssetLibrary
                     assets={draft.assets || []}
@@ -1077,6 +1123,7 @@ export default function App() {
                 )}
                 {view === 'ai' && (
                   <AiPanel
+                    enterToSend={prefs.enterToSend}
                     refs={aiRefs}
                     ai={aiShown}
                     batch={aiBatch}

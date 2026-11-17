@@ -1,5 +1,6 @@
 import { makeAnchor, resolveAnchor, sameAnchor } from '../anchor.js'
 import { IconPin } from './Icons.jsx'
+import { MENTION_GAP, findMentions } from '../mentions.js'
 import { useRegionFade } from '../useRegionFade.js'
 import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
@@ -9,27 +10,7 @@ import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useLayo
 // 标签盖住 @名称 + 这个占位。发给 AI 之前会把占位换成普通空格。
 // 标签的盖板比 @名称 的位置往右缩进这么多：两个标签紧挨着的交界处露出一条缝，光标（落在交界上）才看得见
 const CARET_WINDOW = 3
-export const MENTION_GAP ='  '
-
-// 在 value 里找出所有「@资产名」（名字有长有短时优先匹配长的），以及紧跟着的占位空格
-export function findMentions(value, items) {
-  const out = []
-  if (!items || !items.length) return out
-  const sorted = [...items].sort((a, b) => b.name.length - a.name.length)
-  let i = value.indexOf('@')
-  while (i >= 0) {
-    const hit = sorted.find((it) => value.startsWith(it.name, i + 1))
-    if (hit) {
-      let e = i + 1 + hit.name.length
-      if (value.startsWith(MENTION_GAP, e)) e += MENTION_GAP.length
-      out.push({ s: i, e, item: hit })
-      i = value.indexOf('@', e)
-    } else {
-      i = value.indexOf('@', i + 1)
-    }
-  }
-  return out
-}
+export { MENTION_GAP, findMentions }
 
 // 带「钉住的大圆角选区」的文本框。
 //

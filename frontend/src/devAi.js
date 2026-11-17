@@ -104,7 +104,7 @@ function chatRequest(settings, payload, signal) {
 }
 
 // 流式优化：emit 收到 {type: chunk|done|error}；signal 被 abort 时悄悄退出
-export async function runDevAi(settings, { message, images }, emit, signal) {
+async function runOnce(settings, { message, images }, emit, signal) {
   const payload = {
     model: settings.model,
     stream: true,
@@ -113,15 +113,18 @@ export async function runDevAi(settings, { message, images }, emit, signal) {
   }
   let resp
   try { resp = await chatRequest(settings, payload, signal) } catch (e) {
-    if (signal.aborted) return
-    emit({ type: 'error', message: `无法连接到预览服务：${e.message}` }); return
+    if (signal.aborted) return 'failed'
+    emit({ type: 'error', message: `无法连接到预览服务：${e.message}` }); return 'failed'
   }
   if (!resp.ok) {
     const body = await resp.text().catch(() => '')
     let proxyError = ''
     try { proxyError = JSON.parse(body).proxyError || '' } catch { /* 不是 JSON */ }
-    emit({ type: 'error', message: proxyError ? `无法连接到接口：${proxyError}。请确认地址正确、网络通畅` : httpErrorText(resp.status, body) })
-    return
+    const msg = proxyError ? `无法连接到接口：${proxyError}。请确认地址正确、网络通畅` : httpErrorText(resp.status, body)
+    if (proxyError) return { retry: msg, backoff: false }                       // 连不上 / 被代理掐断：重试
+    if (resp.status === 429 || resp.status >= 500) return { retry: msg, backoff: true }   // 过载 / 限流 / 服务端出错：稍等再试
+    emit({ type: 'error', message: msg })
+    return 'failed'
   }
 
   const filter = makeThinkFilter()
@@ -144,6 +147,9 @@ export async function runDevAi(settings, { message, images }, emit, signal) {
   }
 
   let raw = ''
+  let finish = null      // 服务端给的结束原因（stop / length …）
+  let sawDone = false
+  let sawData = false
   const reader = resp.body.getReader()
   const decoder = new TextDecoder('utf-8')
   let pending = ''
@@ -159,11 +165,17 @@ export async function runDevAi(settings, { message, images }, emit, signal) {
         if (!t || t.startsWith(':') || t.startsWith('event:') || t.startsWith('id:')) continue
         if (t.startsWith('data:')) {
           const data = t.slice(5).trim()
-          if (data === '[DONE]') { pending = ''; break }
+          if (data === '[DONE]') { sawDone = true; pending = ''; break }
           let v
           try { v = JSON.parse(data) } catch { continue }
           const err = errorOf(v)
-          if (err) { emit({ type: 'error', message: `模型返回错误：${err}` }); return }
+          if (err) {
+            if (isTransient(v)) return { retry: `模型返回错误：${err}`, backoff: true }
+            emit({ type: 'error', message: `模型返回错误：${err}` }); return 'failed'
+          }
+          sawData = true
+          const fr = v?.choices?.[0]?.finish_reason
+          if (typeof fr === 'string' && fr) finish = fr
           const rs = v?.choices?.[0]?.delta?.reasoning_content ?? v?.choices?.[0]?.delta?.reasoning
           if (rs) think(rs)
           const c = contentOf(v)
@@ -172,22 +184,64 @@ export async function runDevAi(settings, { message, images }, emit, signal) {
       }
     }
   } catch (e) {
-    if (signal.aborted) return
-    emit({ type: 'error', message: `读取模型输出时中断：${e.message}` }); return
+    if (signal.aborted) return 'failed'
+    return { retry: `读取模型输出时中断：${e.message}`, backoff: false }
   }
-  if (signal.aborted) return
-  if (!any && raw.trim()) {
+  if (signal.aborted) return 'failed'
+  if (raw.trim()) {
+    // 不是 data: 开头的内容：服务端忽略了 stream:true 直接给了完整 JSON，或者（Gemini 常见）输出到一半插进来一段错误 JSON（503 UNAVAILABLE 等，是个数组）
     try {
-      const v = JSON.parse(raw.trim())
+      let v = JSON.parse(raw.trim())
+      if (Array.isArray(v)) v = v[0]
       const err = errorOf(v) || v?.proxyError
-      if (err) { emit({ type: 'error', message: `模型返回错误：${err}` }); return }
-      const c = contentOf(v)
-      if (c) feed(c)
+      if (err) {
+        const status = v?.error?.status || ''
+        const hint = status === 'UNAVAILABLE' || status === 'RESOURCE_EXHAUSTED' ? '服务端暂时过载或限流，稍后重试通常就好。' : ''
+        if (isTransient(v)) return { retry: `模型返回错误：${err}${status ? `（${status}）` : ''}。服务端暂时过载或限流`, backoff: true }
+        emit({ type: 'error', message: `模型返回错误：${err}${status ? `（${status}）` : ''}。${any ? '已生成的部分不完整，没有存进批次。' : ''}` })
+        return 'failed'
+      }
+      if (!any) { const c = contentOf(v); if (c) feed(c) }
     } catch { /* 解析不了就当没有内容 */ }
   }
   out(filter.finish())
-  if (!any) { emit({ type: 'error', message: '模型没有返回任何内容。请确认模型名正确，并且这个接口支持 /chat/completions' }); return }
-  emit({ type: 'done' })
+  if (!any) { emit({ type: 'error', message: '模型没有返回任何内容。请确认模型名正确，并且这个接口支持 /chat/completions' }); return 'failed' }
+  const bad = incompleteReason(finish, sawDone, sawData)
+  if (bad) {
+    if (bad.retry) return { retry: bad.msg, backoff: false }
+    emit({ type: 'error', message: bad.msg }); return 'failed'
+  }
+  emit({ type: 'done', finish: finish || '' })
+  return 'done'
+}
+
+// 服务端临时性错误（过载、限流、内部错误）：重试通常就好
+function isTransient(v) {
+  const code = Number(v?.error?.code) || 0
+  const status = v?.error?.status || ''
+  return code === 429 || (code >= 500 && code <= 599) || ['UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'INTERNAL', 'DEADLINE_EXCEEDED'].includes(status)
+}
+
+const MAX_AUTO_RETRY = 2
+// 连不上、被代理掐断、服务端过载这类临时性问题自动重试（最多 MAX_AUTO_RETRY 次）：重试是整份重新生成（不是续传），
+// 重试前发 retry 事件，界面据此清掉上一次的半截输出
+export async function runDevAi(settings, input, emit, signal) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await runOnce(settings, input, emit, signal)
+    if (typeof res === 'string') return
+    if (signal.aborted) return
+    if (attempt >= MAX_AUTO_RETRY) { emit({ type: 'error', message: `${res.retry}（已自动重试 ${MAX_AUTO_RETRY} 次，仍然失败）` }); return }
+    emit({ type: 'retry', attempt: attempt + 1, max: MAX_AUTO_RETRY, reason: res.retry })
+    if (res.backoff) await new Promise((resolve) => setTimeout(resolve, 1500))   // 服务端过载 / 限流：稍等一下再来
+    if (signal.aborted) return
+  }
+}
+
+function incompleteReason(finish, sawDone, sawData) {
+  if (finish === 'length' || finish === 'max_tokens') return { msg: '输出被截断：模型达到了最大输出长度，内容不完整（没有存进批次）。可以换一个输出更长的模型，或精简额外要求后重试', retry: false }
+  if (finish === 'content_filter' || finish === 'safety') return { msg: '输出被模型的安全策略拦截，内容不完整（没有存进批次）', retry: false }
+  if (!finish && sawData && !sawDone) return { msg: '连接中途断开了，输出不完整（服务端没有正常结束这次输出，没有存进批次）。多半是网络或代理在中途把连接掐断了，不是模型忙', retry: true }
+  return null
 }
 
 export async function testDevAi(settings) {

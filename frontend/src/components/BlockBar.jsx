@@ -3,7 +3,7 @@ import { IconChevron, IconClose } from './Icons.jsx'
 
 // 分镜稿页顶上的「批次栏」：编号 · 批次名（可直接改，点箭头切换批次）· ＋新建批次。
 // 一个批次 = 分镜稿里一段独立的文字，可以（不强制）关联剧本里的一段话；关联了的话会从剧本选区连一根线到这里。
-export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, onDelete, linkState, onUnlink, mode = 'src', onMode = () => { } }) {
+export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, onDelete, linkState, onUnlink, mode = 'src', onMode = () => { }, wheelSwitch = true }) {
   const [open, setOpen] = useState(false)
   const wrapRef = useRef(null)
   const index = Math.max(0, blocks.findIndex((b) => b.id === activeId))
@@ -19,10 +19,23 @@ export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, o
     return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey) }
   }, [open])
 
+  // 鼠标悬停在批次名上滚轮：向下 = 下一个批次，向上 = 上一个（到头不循环）。触控板的小幅滚动先累积，够一格才切一次
+  const wheelAcc = useRef(0)
+  const onWheel = (e) => {
+    if (!wheelSwitch || blocks.length < 2) return
+    if (Math.sign(e.deltaY) !== Math.sign(wheelAcc.current)) wheelAcc.current = 0
+    wheelAcc.current += e.deltaY
+    if (Math.abs(wheelAcc.current) < 50) return
+    const step = wheelAcc.current > 0 ? 1 : -1
+    wheelAcc.current = 0
+    const next = blocks[index + step]
+    if (next) onSelect(next.id)
+  }
+
   return (
     <div className="block-head" ref={wrapRef}>
       <span className="bh-badge" title={active ? `第 ${index + 1} 个批次（共 ${blocks.length} 个）` : ''}>{active ? num(index) : '··'}</span>
-      <div className="bh-title">
+      <div className="bh-title" onWheel={onWheel}>
         {/* 输入框只有文字那么宽：点到文字是编辑；文字右边的空白区域点一下是展开 / 收起批次菜单 */}
         <span className="bh-name-wrap" data-v={active && active.title ? active.title : (active ? '给这个批次起个名字' : '还没有批次')}>
           <input
@@ -35,7 +48,7 @@ export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, o
           />
         </span>
         <span className="bh-fill" onClick={() => blocks.length && setOpen((v) => !v)} aria-hidden="true" />
-        <button className="bh-caret" onClick={() => setOpen((v) => !v)} aria-expanded={open} title="切换批次" aria-label="切换批次" disabled={!blocks.length}>
+        <button className="bh-caret" onClick={() => setOpen((v) => !v)} aria-expanded={open} title="切换批次（也可以在这一栏上滚动滚轮）" aria-label="切换批次" disabled={!blocks.length}>
           <IconChevron size={18} />
         </button>
       </div>
