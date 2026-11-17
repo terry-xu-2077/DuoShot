@@ -23,14 +23,18 @@ export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, o
     <div className="block-head" ref={wrapRef}>
       <span className="bh-badge" title={active ? `第 ${index + 1} 个批次（共 ${blocks.length} 个）` : ''}>{active ? num(index) : '··'}</span>
       <div className="bh-title">
-        <input
-          value={active ? active.title : ''}
-          onChange={(e) => onTitle(e.target.value)}
-          placeholder={active ? '给这个批次起个名字' : '还没有批次'}
-          maxLength={40}
-          disabled={!active}
-          spellCheck={false}
-        />
+        {/* 输入框只有文字那么宽：点到文字是编辑；文字右边的空白区域点一下是展开 / 收起批次菜单 */}
+        <span className="bh-name-wrap" data-v={active && active.title ? active.title : (active ? '给这个批次起个名字' : '还没有批次')}>
+          <input
+            value={active ? active.title : ''}
+            onChange={(e) => onTitle(e.target.value)}
+            placeholder={active ? '给这个批次起个名字' : '还没有批次'}
+            maxLength={40}
+            disabled={!active}
+            spellCheck={false}
+          />
+        </span>
+        <span className="bh-fill" onClick={() => blocks.length && setOpen((v) => !v)} aria-hidden="true" />
         <button className="bh-caret" onClick={() => setOpen((v) => !v)} aria-expanded={open} title="切换批次" aria-label="切换批次" disabled={!blocks.length}>
           <IconChevron size={18} />
         </button>
@@ -60,13 +64,13 @@ export default function BlockBar({ blocks, activeId, onSelect, onAdd, onTitle, o
       </button>
 
       {open && (
-        <ul className="bh-menu" role="listbox">
+        <ul className="menu bh-menu" role="listbox">
           {blocks.map((b, i) => (
             <li
               key={b.id}
               role="option"
               aria-selected={b.id === activeId}
-              className={`bh-item${b.id === activeId ? ' sel' : ''}`}
+              className={`menu-item bh-item${b.id === activeId ? ' sel' : ''}`}
               onClick={() => { onSelect(b.id); setOpen(false) }}
             >
               <span className="bh-badge sm">{num(i)}</span>

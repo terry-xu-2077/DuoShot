@@ -1,7 +1,9 @@
 import React, { useState } from 'react'
 import { api, DEFAULT_SETTINGS } from '../api.js'
 import { IconEye, IconEyeOff } from './Icons.jsx'
+import Dropdown from './Dropdown.jsx'
 
+const GEMINI = { name: 'Google AI Studio', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash' }
 const newPresetId = () => `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`
 
 // 把设置整理成预设列表：旧版只有一套接口设置，当成一个叫「默认」的预设
@@ -50,6 +52,12 @@ export default function SettingsModal({ settings, onClose, onSaved, notify }) {
     setSelId(rest[0].id)
     setTestResult(null)
   }
+  // Google AI Studio 的 Gemini API 自带 OpenAI 兼容入口，直接用同一套调用；只需要填地址、模型名和 Key
+  const fillGemini = () => {
+    const generic = /^预设 \d+$|^默认$|^未命名预设$/.test((cur.name || '').trim())
+    patch({ baseUrl: GEMINI.baseUrl, model: cur.model && /gemini/i.test(cur.model) ? cur.model : GEMINI.model, name: generic || !(cur.name || '').trim() ? GEMINI.name : cur.name })
+    setTestResult(null)
+  }
   const choose = (id) => { setSelId(id); setTestResult(null); setShowKey(false) }
 
   const test = async () => {
@@ -90,9 +98,8 @@ export default function SettingsModal({ settings, onClose, onSaved, notify }) {
           <div className="field">
             <label>预设（保存后，当前选中的这个就是正在使用的）</label>
             <div className="field-row preset-row">
-              <select className="text-input preset-select" value={cur.id} onChange={(e) => choose(e.target.value)}>
-                {presets.map((p) => <option key={p.id} value={p.id}>{p.name || '未命名预设'}</option>)}
-              </select>
+              <Dropdown className="preset-select" value={cur.id} onChange={choose}
+                options={presets.map((p) => ({ value: p.id, label: p.name || '未命名预设' }))} />
               <button className="btn" onClick={addPreset} title="新建一个空白预设">＋ 新建</button>
               <button className="btn" onClick={copyPreset} title="复制当前预设（连 Key 一起）">复制</button>
               <button className="btn danger-ghost" onClick={removePreset} disabled={presets.length <= 1} title={presets.length <= 1 ? '至少保留一个预设' : '删除当前预设'}>删除</button>
@@ -109,7 +116,11 @@ export default function SettingsModal({ settings, onClose, onSaved, notify }) {
             <label>接口地址（Base URL）</label>
             <input className="text-input mono" value={cur.baseUrl} onChange={(e) => patch({ baseUrl: e.target.value })} spellCheck={false}
               placeholder="http://127.0.0.1:11434/v1" />
-            <div className="field-hint">程序会在后面自动加上 /chat/completions</div>
+            <div className="field-hint">
+              程序会在后面自动加上 /chat/completions。
+              <button className="link-btn" type="button" onClick={fillGemini} title={GEMINI.baseUrl}>填入 Google AI Studio（Gemini）</button>
+              ，Key 到 aistudio.google.com 的「Get API key」里创建
+            </div>
           </div>
 
           <div className="field">
@@ -122,7 +133,7 @@ export default function SettingsModal({ settings, onClose, onSaved, notify }) {
             <label>API Key（本地模型可留空）</label>
             <div className="field-row">
               <input className="text-input mono" type={showKey ? 'text' : 'password'} value={cur.apiKey}
-                onChange={(e) => patch({ apiKey: e.target.value })} spellCheck={false} placeholder="sk-…" autoComplete="off" />
+                onChange={(e) => patch({ apiKey: e.target.value })} spellCheck={false} placeholder="sk-… / AIza…" autoComplete="off" />
               <button className="icon-btn boxed" onClick={() => setShowKey((v) => !v)} title={showKey ? '隐藏' : '显示'}>
                 {showKey ? <IconEyeOff /> : <IconEye />}
               </button>

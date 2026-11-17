@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import fs from 'node:fs'
+import http from 'node:http'
+import { execSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -10,6 +12,28 @@ const PORTABLE_SETTINGS = path.resolve(here, '../release/分镜对照-绿色版/
 
 const PORTABLE_ASSETS = path.resolve(here, '../release/分镜对照-绿色版/assets')
 const PORTABLE_DRAFTS =path.resolve(here, '../release/分镜对照-绿色版/drafts.json')
+
+// 预览里的 /__dev/chat 由 Node 转发请求；访问 Google 等在线接口要走代理：环境变量优先，没有就读 Windows 系统代理。本机地址不走代理
+function enableProxy() {
+  try {
+    const env = process.env
+    let proxy = env.HTTPS_PROXY || env.https_proxy || env.ALL_PROXY || env.all_proxy || ''
+    if (!proxy && process.platform === 'win32') {
+      const q = (n) => {
+        const out = execSync(`reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ${n}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+        return (out.split(/\r?\n/).find((l) => l.includes(n)) || '').trim().split(/\s+/).pop()
+      }
+      if (q('ProxyEnable') === '0x1') {
+        const server = q('ProxyServer') || ''
+        proxy = server.split(';').map((p) => p.replace(/^https?=/, '')).find((p) => p && !p.includes('=')) || ''
+      }
+    }
+    if (!proxy || typeof http.setGlobalProxyFromEnv !== 'function') return
+    if (!/^\w+:\/\//.test(proxy)) proxy = `http://${proxy}`
+    http.setGlobalProxyFromEnv({ HTTPS_PROXY: proxy, HTTP_PROXY: proxy, NO_PROXY: 'localhost,127.0.0.1,::1,.local,192.168.0.0/16,10.0.0.0/8' })
+  } catch { /* 拿不到代理就直连 */ }
+}
+enableProxy()
 
 function readPortableSettings() {
   try {

@@ -1,5 +1,5 @@
 import React, { useLayoutEffect, useRef, useState } from 'react'
-import { IconStar4, IconClose, IconSearch, IconPlusBig } from './Icons.jsx'
+import { IconStar4, IconClose, IconSearch } from './Icons.jsx'
 import { fmtFullDate } from '../api.js'
 
 // 白色「新建」卡片的内圈虚线：向内缩进 INSET，沿着「标签＋卡片」整体轮廓走
@@ -71,7 +71,6 @@ export default function Home({ list, currentId, onOpen, onNew, onDelete }) {
           <span className="fc-body">
             <span className="fc-head"><span className="fc-name">空白分镜稿</span></span>
             <span className="fc-meta">从空白开始，写一份新的分镜稿</span>
-            <span className="fc-bigplus"><IconPlusBig size={56} /></span>
           </span>
         </button>
         {shown.map((d) => (

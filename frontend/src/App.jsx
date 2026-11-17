@@ -117,7 +117,7 @@ export default function App() {
   const [saveInfo, setSaveInfo] = useState({ state: 'idle', at: null })
   const [settings, setSettings] = useState(null)
   const [showSettings, setShowSettings] = useState(false)
-  const [ai, setAi] = useState({ phase: 'idle', text: '', error: '', extra: '', target: '' })   // target：这次优化针对的批次 id
+  const [ai, setAi] = useState({ phase: 'idle', text: '', think: '', error: '', extra: '', target: '' })   // target：这次优化针对的批次 id
   const [optView, setOptView] = useState('preview')     // AI 稿：preview Markdown 预览 / edit 编辑
   const [boardMode, setBoardMode] = useState('src')       // 分镜稿页当前批次：src 手写分镜稿 / opt AI 优化稿
   const [confirmDel, setConfirmDel] = useState(null)   // 正在弹窗确认删除的分镜稿 {id, title}
@@ -188,7 +188,7 @@ export default function App() {
     setDraft(doc)
     setActiveBlockId(doc.blocks[0]?.id || '')
     setSavedAt(doc.updatedAt || null)
-    setAi((p) => ({ ...p, phase: 'idle', text: '', error: '', target: '' }))
+    setAi((p) => ({ ...p, phase: 'idle', text: '', think: '', error: '', target: '' }))
     setBoardMode('src')
     setRightTab('board')
     setScriptView('preview')
@@ -321,7 +321,7 @@ export default function App() {
         draftRef.current = EMPTY
         setDraft(EMPTY)
         setSavedAt(null)
-        setAi((p) => ({ ...p, phase: 'idle', text: '', error: '' }))
+        setAi((p) => ({ ...p, phase: 'idle', text: '', think: '', error: '' }))
         go('home')
       } else if (r.doc.id !== draftRef.current.id) applyDoc(r.doc)
       notify(doneText)
@@ -702,6 +702,8 @@ export default function App() {
       if (p.phase !== 'running') return p
       switch (ev.type) {
         case 'chunk': return { ...p, text: p.text + ev.text }
+        case 'think': return { ...p, think: p.think + ev.text }   // 模型的思考过程，在 AI 页以可折叠的灰色块显示（不存进批次）
+        case 'rethink': return { ...p, think: p.think + p.text, text: '' }   // 只有 </think> 没有 <think>：前面当正文收到的其实是思考，挪进思考区
         case 'done': return { ...p, phase: 'done' }
         case 'stopped': return { ...p, phase: 'stopped' }
         case 'error': return { ...p, phase: 'error', error: ev.message }
@@ -716,11 +718,53 @@ export default function App() {
     const t = ai.text.replace(/\s+$/, '')
     const blk = (draftRef.current.blocks || []).find((b) => b.id === ai.target)
     if (!blk || (blk.optimized || '') === t) return
+    // 模型有时会把手写的分镜稿原样吐回来（没有优化）：这种结果不存，直接提示
+    const norm = (s) => (s || '').replace(/[\s ​]+/g, '')
+    if (norm(t) === norm(blk.text)) {
+      setAi((p) => ({ ...p, phase: 'error', error: '模型把你手写的分镜稿原样返回了，没有做优化，所以没有保存。可以换个模型预设，或在「额外要求」里写明“按分镜脚本大师的格式输出完整提示词”后重试。' }))
+      return
+    }
     const next = { ...draftRef.current, blocks: draftRef.current.blocks.map((b) => (b.id === ai.target ? { ...b, optimized: t } : b)) }
     draftRef.current = next
     setDraft(next)
     scheduleSave(next)
   }, [ai.phase, ai.text, ai.target, scheduleSave])
+
+  // Ctrl+A 只全选「当前所在那一页」的文字，不选整个界面：
+  // 记下最后点击的页（folder-body）；输入框 / 文本框 / 可编辑区里按 Ctrl+A 本来就只选自己，不干预。
+  useEffect(() => {
+    let lastPane = null
+    const onDown = (e) => { lastPane = e.target.closest ? e.target.closest('.folder-body') : null }
+    const onKey = (e) => {
+      if (!((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'a' || e.key === 'A'))) return
+      const t = e.target
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+      if (document.querySelector('.modal')) return
+      e.preventDefault()
+      const pane = lastPane && lastPane.isConnected ? lastPane : null
+      if (!pane) return
+      // 预览模式下文本框可能还挂在页面里但是不可见，只认看得见的编辑区
+      const editable = [...pane.querySelectorAll('[contenteditable="true"], textarea')].find((el) => {
+        const cs = getComputedStyle(el)
+        return el.getClientRects().length > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0' && cs.pointerEvents !== 'none'
+      })
+      if (editable) {   // 这一页是编辑区：把焦点给它，选它自己的全部内容
+        editable.focus()
+        if (editable.tagName === 'TEXTAREA') editable.select()
+        else document.execCommand('selectAll')
+        return
+      }
+      const body = pane.querySelector('.md-view, .ai-body') || pane
+      const sel = window.getSelection()
+      const r = document.createRange()
+      r.selectNodeContents(body)
+      sel.removeAllRanges()
+      sel.addRange(r)
+    }
+    document.addEventListener('mousedown', onDown, true)
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', onDown, true); document.removeEventListener('keydown', onKey) }
+  }, [])
 
   const startAi = async () => {
     if (!aiConfigured(settings)) { notify('还没配置 AI 接口，请先填写地址和模型名', true); setShowSettings(true); return }
@@ -743,7 +787,7 @@ export default function App() {
     if (notes.length) notify(notes.join('；'))
     clearTimeout(saveT.current)
     await persist(d).catch(() => { })
-    setAi((p) => ({ ...p, phase: 'running', text: '', error: '', target: target.id }))
+    setAi((p) => ({ ...p, phase: 'running', text: '', think: '', error: '', target: target.id }))
     const message = buildAiMessage({ script: d.script || '', blocks: d.blocks || [], target, assets: d.assets || [], refs: picked, extra: aiRef.current.extra })
     try { await api.invoke('ai:start', message, images) }
     catch (e) { setAi((p) => ({ ...p, phase: 'error', error: e.message })) }
@@ -777,7 +821,7 @@ export default function App() {
   const view = rightTab
   const showOptView = view === 'board' && boardMode === 'opt' && !!active
   // AI 优化页只跟「当前选中的批次」打交道：别的批次的上一次结果不在这里显示（正在生成的除外）
-  const aiShown = ai.target && active && ai.target !== active.id && ai.phase !== 'running' ? { ...ai, phase: 'idle', text: '', error: '' } : ai
+  const aiShown = ai.target && active && ai.target !== active.id && ai.phase !== 'running' ? { ...ai, phase: 'idle', text: '', think: '', error: '' } : ai
   const aiBatch = active ? { num: String(blocks.indexOf(active) + 1).padStart(2, '0'), title: active.title.trim(), hasOpt: !!(active.optimized || '').trim() } : null
   const aiRunningFor = ai.phase === 'running' && active && ai.target !== active.id ? blocks.find((b) => b.id === ai.target) : null
 
@@ -823,15 +867,15 @@ export default function App() {
               </button>
               {menuOpen && (
                 <div className="menu-anchor">
-                  <ul className="hm-panel" role="listbox">
-                    <li className="hm-head" aria-hidden="true">分镜稿 <b>{list.length} 份</b></li>
+                  <ul className="menu hm-panel" role="listbox">
+                    <li className="menu-head hm-head" aria-hidden="true">分镜稿 <b>{list.length} 份</b></li>
                     <li className="hm-new" role="option" onClick={newDoc}><span className="plus">＋</span>新建分镜稿</li>
                     {list.map((h) => (
                       <li
                         key={h.id}
                         role="option"
                         aria-selected={h.id === draft.id}
-                        className={`hm-item ${h.id === draft.id ? 'sel' : ''}`}
+                        className={`menu-item hm-item ${h.id === draft.id ? 'sel' : ''}`}
                         onClick={() => openDoc(h.id)}
                       >
                         <span className="hm-text">

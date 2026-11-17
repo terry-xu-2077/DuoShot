@@ -883,12 +883,66 @@ fn build_user_content(text: &str, images: &[ImageRef]) -> Value {
     Value::Array(parts)
 }
 
-fn make_agent(read_timeout_secs: u64) -> ureq::Agent {
-    ureq::AgentBuilder::new()
+/// 访问在线接口（如 Google AI Studio）要走代理时用：先看环境变量，没有再看 Windows 的系统代理
+fn system_proxy() -> Option<String> {
+    for k in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let q = |name: &str| -> Option<String> {
+            let out = std::process::Command::new("reg")
+                .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings", "/v", name])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            text.lines().find(|l| l.contains(name)).and_then(|l| l.split_whitespace().last().map(|s| s.to_string()))
+        };
+        if q("ProxyEnable").as_deref() == Some("0x1") {
+            let server = q("ProxyServer")?;
+            // 可能是「host:port」，也可能是「http=h:p;https=h:p」
+            let pick = server
+                .split(';')
+                .find_map(|p| p.strip_prefix("https=").or_else(|| p.strip_prefix("http=")))
+                .unwrap_or(server.as_str());
+            if !pick.contains('=') {
+                return Some(pick.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 本机 / 局域网地址（本地 llama.cpp、Ollama 等）不走代理
+fn is_local_url(url: &str) -> bool {
+    let host = url.split("://").nth(1).unwrap_or(url).split(['/', ':']).next().unwrap_or("");
+    host == "localhost"
+        || host.ends_with(".local")
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host == "[::1]"
+}
+
+fn make_agent(read_timeout_secs: u64, url: &str) -> ureq::Agent {
+    let mut b = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(read_timeout_secs))
-        .timeout_write(Duration::from_secs(30))
-        .build()
+        .timeout_write(Duration::from_secs(30));
+    if !is_local_url(url) {
+        if let Some(p) = system_proxy() {
+            if let Ok(proxy) = ureq::Proxy::new(&p) {
+                b = b.proxy(proxy);
+            }
+        }
+    }
+    b.build()
 }
 
 fn http_error_text(code: u16, body: &str) -> String {
@@ -896,6 +950,7 @@ fn http_error_text(code: u16, body: &str) -> String {
         .ok()
         .and_then(|v| {
             v.pointer("/error/message")
+                .or_else(|| v.pointer("/0/error/message"))   // Gemini 的错误是数组
                 .or_else(|| v.pointer("/message"))
                 .or_else(|| v.pointer("/error"))
                 .and_then(|m| m.as_str().map(|s| s.to_string()))
@@ -904,6 +959,7 @@ fn http_error_text(code: u16, body: &str) -> String {
         .trim()
         .to_string();
     let hint = match code {
+        400 => "请求被拒绝，常见原因：API Key 无效（Gemini 会返回 400）、模型名不对",
         401 | 403 => "API Key 无效、已过期或没有权限，请到设置里检查",
         404 => "接口地址不对（找不到 /chat/completions），请检查 Base URL 和模型名",
         429 => "请求太频繁或额度已用完，请稍后再试",
@@ -931,9 +987,10 @@ fn describe_error(e: ureq::Error) -> String {
 }
 
 fn prepare_request(cfg: &AiCfg, stream: bool) -> ureq::Request {
-    let agent = make_agent(if stream { 180 } else { 45 });   // 流式：两次数据之间最多等多久（推理型模型开头会想很久）
+    let url = chat_url(&cfg.base_url);
+    let agent = make_agent(if stream { 180 } else { 45 }, &url);   // 流式：两次数据之间最多等多久（推理型模型开头会想很久）
     let mut req = agent
-        .post(&chat_url(&cfg.base_url))
+        .post(&url)
         .set("Content-Type", "application/json")
         .set("Accept", if stream { "text/event-stream" } else { "application/json" });
     if !cfg.api_key.is_empty() {
@@ -948,6 +1005,10 @@ fn prepare_request(cfg: &AiCfg, stream: bool) -> ureq::Request {
 struct ThinkFilter {
     in_think: bool,
     buf: String,
+    /// 遇到了「只有 </think>」的情况，前面已经发出去的文字都是思考过程，需要让界面清掉
+    reset: bool,
+    /// 这次 push 里识别出来的思考文字（调用方取走）
+    think_out: String,
 }
 
 fn partial_suffix(s: &str, tag: &str) -> usize {
@@ -963,24 +1024,38 @@ impl ThinkFilter {
         loop {
             if self.in_think {
                 if let Some(i) = self.buf.find(CLOSE) {
+                    self.think_out.push_str(&self.buf[..i]);
                     self.buf.drain(..i + CLOSE.len());
                     self.in_think = false;
                 } else {
                     let keep = partial_suffix(&self.buf, CLOSE);
                     let cut = self.buf.len() - keep;
+                    self.think_out.push_str(&self.buf[..cut]);
                     self.buf.drain(..cut);
                     break;
                 }
-            } else if let Some(i) = self.buf.find(OPEN) {
-                out.push_str(&self.buf[..i]);
-                self.buf.drain(..i + OPEN.len());
-                self.in_think = true;
             } else {
-                let keep = partial_suffix(&self.buf, OPEN);
-                let cut = self.buf.len() - keep;
-                out.push_str(&self.buf[..cut]);
-                self.buf.drain(..cut);
-                break;
+                let o = self.buf.find(OPEN);
+                let c = self.buf.find(CLOSE);
+                if let Some(j) = c.filter(|&j| o.map_or(true, |i| j < i)) {
+                    // 只有 </think> 没有 <think>：模板已经替模型把 <think> 写进提示词了，
+                    // 所以它前面吐出来的全是思考过程。丢掉它们（已经发给界面的部分由调用方清掉）
+                    self.think_out.push_str(&out);
+                    self.think_out.push_str(&self.buf[..j]);
+                    self.buf.drain(..j + CLOSE.len());
+                    out.clear();
+                    self.reset = true;
+                } else if let Some(i) = o {
+                    out.push_str(&self.buf[..i]);
+                    self.buf.drain(..i + OPEN.len());
+                    self.in_think = true;
+                } else {
+                    let keep = partial_suffix(&self.buf, OPEN).max(partial_suffix(&self.buf, CLOSE));
+                    let cut = self.buf.len() - keep;
+                    out.push_str(&self.buf[..cut]);
+                    self.buf.drain(..cut);
+                    break;
+                }
             }
         }
         out
@@ -1010,6 +1085,14 @@ fn content_of(v: &Value) -> Option<String> {
     v.pointer("/choices/0/delta/content")
         .or_else(|| v.pointer("/choices/0/message/content"))
         .or_else(|| v.pointer("/choices/0/text"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+}
+
+/// 服务端把思考过程单独放在 delta.reasoning_content（或 reasoning）里的情况
+fn reasoning_of(v: &Value) -> Option<String> {
+    v.pointer("/choices/0/delta/reasoning_content")
+        .or_else(|| v.pointer("/choices/0/delta/reasoning"))
         .and_then(|c| c.as_str())
         .map(|s| s.to_string())
 }
@@ -1044,8 +1127,24 @@ impl AiSink<'_> {
         (self.emit)(json!({ "type": "chunk", "text": text }));
     }
 
+    /// 模型的思考过程：单独发给界面，在 AI 页以可折叠的灰色块显示（不会存进批次）
+    fn think(&mut self, text: &str) {
+        if !text.is_empty() {
+            (self.emit)(json!({ "type": "think", "text": text }));
+        }
+    }
+
     fn feed(&mut self, text: &str) {
         let visible = self.filter.push(text);
+        if self.filter.reset {
+            // 只有 </think>：前面已经当成正文发出去的文字其实是思考，让界面把它们挪到思考区
+            self.filter.reset = false;
+            self.started = false;
+            self.any = false;
+            (self.emit)(json!({ "type": "rethink" }));
+        }
+        let thinking = std::mem::take(&mut self.filter.think_out);
+        self.think(&thinking);
         self.out(visible);
     }
 
@@ -1093,6 +1192,9 @@ fn stream_chat(cfg: &AiCfg, body: &Value, cancelled: &dyn Fn() -> bool, emit: &m
             if let Some(msg) = error_of(&v) {
                 (sink.emit)(json!({ "type": "error", "message": format!("模型返回错误：{msg}") }));
                 return;
+            }
+            if let Some(text) = reasoning_of(&v) {
+                sink.think(&text);
             }
             if let Some(text) = content_of(&v) {
                 sink.feed(&text);
@@ -1329,6 +1431,27 @@ mod tests {
         }
         out.push_str(&f.finish());
         assert_eq!(out.trim_start(), "镜头1｜全景｜雨夜");
+    }
+
+    #[test]
+    fn think_filter_drops_thinking_before_a_lone_close_tag() {
+        let mut f = ThinkFilter::default();
+        let mut shown = String::new();
+        let mut resets = 0;
+        for piece in ["先想", "一想…</thi", "nk>\n\n镜头1｜全景", "｜雨夜"] {
+            let visible = f.push(piece);
+            if f.reset {
+                f.reset = false;
+                resets += 1;
+                shown.clear();
+            }
+            shown.push_str(&visible);
+        }
+        shown.push_str(&f.finish());
+        assert_eq!(resets, 1);
+        assert_eq!(shown.trim_start(), "镜头1｜全景｜雨夜");
+        // 前面已经当正文发出去的「先想一想…」由界面在收到 rethink 时挪进思考区；这里 think_out 里只有尚未发出的部分
+        assert!(f.think_out.is_empty());
     }
 
     #[test]

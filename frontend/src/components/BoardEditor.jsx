@@ -472,15 +472,15 @@ const BoardEditor = forwardRef(function BoardEditor({ value = '', onChange, hidd
         if (wrap && top + h > wrap.clientHeight) top = Math.max(4, menu.y - 30 - h)   // 下面放不下就翻到上面
         const left = Math.max(8, Math.min(menu.x, (wrap ? wrap.clientWidth : 400) - 260))
         return (
-          <div className="mention-menu" style={{ left, top, maxHeight: h, overflowY: 'auto' }} onMouseDown={(e) => e.preventDefault()} role="listbox">
-            {mentionItems.length === 0 && <div className="mention-empty">{mentionEmpty || '资源库还是空的'}</div>}
-            {mentionItems.length > 0 && menuItems.length === 0 && <div className="mention-empty">没有叫「{menu.query}」的资产</div>}
+          <div className="menu mention-menu" style={{ left, top, maxHeight: h, overflowY: 'auto' }} onMouseDown={(e) => e.preventDefault()} role="listbox">
+            {mentionItems.length === 0 && <div className="menu-empty">{mentionEmpty || '资源库还是空的'}</div>}
+            {mentionItems.length > 0 && menuItems.length === 0 && <div className="menu-empty">没有叫「{menu.query}」的资产</div>}
             {menuItems.map((it, i) => (
               <div
                 key={it.id}
                 role="option"
                 aria-selected={i === Math.min(menu.active, menuItems.length - 1)}
-                className={`mention-item${i === Math.min(menu.active, menuItems.length - 1) ? ' on' : ''}`}
+                className={`menu-item mention-item${i === Math.min(menu.active, menuItems.length - 1) ? ' on' : ''}`}
                 onMouseEnter={() => setMenu((m) => ({ ...m, active: i }))}
                 onClick={() => pickMention(it)}
               >

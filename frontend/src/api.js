@@ -326,8 +326,9 @@ const mock = {
       }
       case 'ai:start': {
         const s = await currentSettings()
-        if (s.apiKey && !flag('ai-error') && !flag('ai-slow')) {
-          // 有 Key：真实调用（经开发服务器转发），逻辑和 Rust 端一致
+        if (s.baseUrl && s.model && !flag('ai-error') && !flag('ai-slow')) {
+          // 配了接口地址和模型名（本地模型可以没有 Key）：真实调用（经开发服务器转发），逻辑和 Rust 端一致；
+          // 以前只在有 Key 时才真调用，本地模型没 Key 会落到下面的演示数据（把手写稿原样返回），看起来就像模型把原文吐了回来
           if (aiAbort) aiAbort.abort()
           const ctrl = new AbortController()
           aiAbort = ctrl

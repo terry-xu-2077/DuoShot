@@ -30,7 +30,8 @@ function userContent(message, images) {
 function httpErrorText(code, body) {
   let detail = ''
   try {
-    const v = JSON.parse(body)
+    let v = JSON.parse(body)
+    if (Array.isArray(v)) v = v[0]   // Gemini 的错误是数组
     detail = v?.error?.message || v?.message || (typeof v?.error === 'string' ? v.error : '') || v?.proxyError || ''
   } catch { detail = (body || '').slice(0, 200) }
   const hint = code === 401 || code === 403 ? 'API Key 无效、已过期或没有权限，请到设置里检查'
@@ -41,7 +42,7 @@ function httpErrorText(code, body) {
   return `接口返回 ${code}：${hint}${detail ? `（${String(detail).trim()}）` : ''}`
 }
 
-// 把 <think>…</think> 滤掉；标签可能被切在两个 chunk 之间
+// 把 <think>…</think> 里的思考过程分出来（正文走 push 的返回值，思考走 thinkOut）；标签可能被切在两个 chunk 之间
 function makeThinkFilter() {
   let inThink = false
   let buf = ''
@@ -56,11 +57,18 @@ function makeThinkFilter() {
       for (;;) {
         if (inThink) {
           const i = buf.indexOf('</think>')
-          if (i >= 0) { buf = buf.slice(i + 8); inThink = false } else { buf = buf.slice(buf.length - partial(buf, '</think>')); break }
+          if (i >= 0) { this.thinkOut += buf.slice(0, i); buf = buf.slice(i + 8); inThink = false } else {
+            const cut = buf.length - partial(buf, '</think>')
+            this.thinkOut += buf.slice(0, cut); buf = buf.slice(cut); break
+          }
         } else {
           const i = buf.indexOf('<think>')
-          if (i >= 0) { out += buf.slice(0, i); buf = buf.slice(i + 7); inThink = true } else {
-            const keep = partial(buf, '<think>')
+          const j = buf.indexOf('</think>')
+          if (j >= 0 && (i < 0 || j < i)) {
+            // 只有 </think> 没有 <think>（模板已替模型写了开头）：前面吐出来的全是思考过程，丢掉，并通知调用方清空已显示的部分
+            this.thinkOut += out + buf.slice(0, j); buf = buf.slice(j + 8); out = ''; this.reset = true
+          } else if (i >= 0) { out += buf.slice(0, i); buf = buf.slice(i + 7); inThink = true } else {
+            const keep = Math.max(partial(buf, '<think>'), partial(buf, '</think>'))
             out += buf.slice(0, buf.length - keep)
             buf = buf.slice(buf.length - keep)
             break
@@ -69,6 +77,8 @@ function makeThinkFilter() {
       }
       return out
     },
+    reset: false,
+    thinkOut: '',   // 这次 push 里识别出来的思考文字，调用方取走
     finish() { const t = inThink ? '' : buf; buf = ''; return t },
   }
 }
@@ -123,7 +133,15 @@ export async function runDevAi(settings, { message, images }, emit, signal) {
     started = true; any = true
     emit({ type: 'chunk', text: t })
   }
-  const feed = (text) => out(filter.push(text))
+  const think = (text) => { if (text) emit({ type: 'think', text }) }   // 思考过程：单独发给界面，在 AI 页以可折叠的灰色块显示
+  const feed = (text) => {
+    const visible = filter.push(text)
+    // 只有 </think>：前面已经当正文发出去的文字其实是思考，让界面把它们挪到思考区
+    if (filter.reset) { filter.reset = false; started = false; any = false; emit({ type: 'rethink' }) }
+    const thinking = filter.thinkOut; filter.thinkOut = ''
+    think(thinking)
+    out(visible)
+  }
 
   let raw = ''
   const reader = resp.body.getReader()
@@ -146,6 +164,8 @@ export async function runDevAi(settings, { message, images }, emit, signal) {
           try { v = JSON.parse(data) } catch { continue }
           const err = errorOf(v)
           if (err) { emit({ type: 'error', message: `模型返回错误：${err}` }); return }
+          const rs = v?.choices?.[0]?.delta?.reasoning_content ?? v?.choices?.[0]?.delta?.reasoning
+          if (rs) think(rs)
           const c = contentOf(v)
           if (c) feed(c)
         } else if (raw.length < 262144) raw += `${t}\n`
